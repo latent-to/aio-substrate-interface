@@ -17,6 +17,8 @@ def _check_conflicts():
             "    pip uninstall scalecodec cyscale -y\n\n"
             "Then reinstall cyscale:\n"
             "    pip install cyscale --force-reinstall\n"
+            "If this does not work, consult the documentation: "
+            "https://github.com/latent-to/async-substrate-interface/blob/master/README.md#cysaleinstallationissue\n"
         )
     except importlib.metadata.PackageNotFoundError:
         pass  # Good — scalecodec is not installed
