@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.1.0 /2026-06-01
+
+## What's Changed
+
+* Cache inflight current chain-head requests by @thewhaleking
+  in https://github.com/latent-to/async-substrate-interface/pull/357
+* Run bittensor e2e concurrently by @thewhaleking in https://github.com/latent-to/async-substrate-interface/pull/358
+
+**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v2.0.4...v2.1.0
+
 ## 2.0.4 /2026-05-13
 
 ## What's Changed

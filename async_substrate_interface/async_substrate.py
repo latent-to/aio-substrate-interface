@@ -2818,6 +2818,16 @@ class AsyncSubstrateInterface(SubstrateMixin):
         return (await self.rpc_request("chain_getBlockHash", [block_id]))["result"]
 
     async def get_chain_head(self) -> str:
+        return await self._cached_get_chain_head()
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _cached_get_chain_head(self) -> str:
+        """
+        Resolves the chaintip. Decorated as a dedup-only fetcher (never memoized, since the
+        chaintip goes stale) so that concurrent callers share a single `chain_getHead` request.
+        Kept separate from the public `get_chain_head` so the latter stays a plain coroutine
+        method — friendlier to introspection/mocking by downstream consumers.
+        """
         response = await self._make_rpc_request(
             [
                 self.make_payload(
@@ -3275,6 +3285,12 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Returns:
             Hash of the most-recently finalized block
         """
+        return await self._cached_get_chain_finalised_head()
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _cached_get_chain_finalised_head(self) -> str:
+        # Dedup-only fetcher (see `_cached_get_chain_head`): the finalized head advances, so it
+        # is never memoized, but concurrent callers still share a single request.
         response = await self.rpc_request("chain_getFinalizedHead", [])
         return response["result"]
 
@@ -4286,7 +4302,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
     async def get_block_number(self, block_hash: Optional[str] = None) -> int:
         """Async version of `substrateinterface.base.get_block_number` method."""
         if block_hash is None:
-            return await self._get_block_number(None)
+            return await self._get_current_block_number()
         if (block := self.runtime_cache.blocks_reverse.get(block_hash)) is not None:
             return block
         block = await self._cached_get_block_number(block_hash)
@@ -4300,6 +4316,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
         as is the case with DiskCachedAsyncSubstrateInterface._cached_get_block_number
         """
         return await self._get_block_number(block_hash=block_hash)
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _get_current_block_number(self) -> int:
+        response = await self.rpc_request("chain_getHeader", [None])
+        return int(response["result"]["number"], 16)
 
     async def _get_block_number(self, block_hash: Optional[str]) -> int:
         response = await self.rpc_request("chain_getHeader", [block_hash])

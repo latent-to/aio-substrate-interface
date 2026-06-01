@@ -55,7 +55,7 @@ jobs:
   check-labels:
     needs: apply-label-to-new-pr
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     outputs:
       run-sdk-tests: ${{ steps.check-manual.outputs.run-sdk-tests || steps.get-labels-pr.outputs.run-sdk-tests }}
     steps:
@@ -88,10 +88,10 @@ jobs:
 
   find-e2e-tests:
     needs: check-labels
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
     outputs:
-      test-files: ${{ steps.get-tests.outputs.test-files }}
+      test-cases: ${{ steps.get-tests.outputs.test-cases }}
     steps:
       - name: Research preparation
         working-directory: ${{ github.workspace }}
@@ -110,11 +110,26 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install -y jq
 
-      - name: Find e2e test files
+      - name: Find e2e test cases
         id: get-tests
         run: |
-          test_files=$(find ${{ github.workspace }}/bittensor/tests/e2e_tests -name "test*.py" | jq -R -s -c 'split("\n") | map(select(. != ""))')
-          echo "test-files=$test_files" >> $GITHUB_OUTPUT
+          # Emit one matrix entry per individual test function (as a `path::test_name`
+          # node id) rather than per file, so each test gets its own concurrent job.
+          # The e2e suite has no test classes, so grepping top-level `def test_*` is
+          # sufficient and keeps this job dependency-free (no pytest collection needed).
+          # Node ids are relative to the bittensor repo root so they resolve inside the
+          # prebuilt image (where bittensor lives at /opt/bittensor), not the workspace.
+          cd "${{ github.workspace }}/bittensor"
+          test_cases=$(
+            while IFS= read -r f; do
+              grep -oE '^(async[[:space:]]+)?def[[:space:]]+test_[A-Za-z0-9_]+' "$f" \
+                | grep -oE 'test_[A-Za-z0-9_]+' \
+                | while IFS= read -r name; do printf '%s::%s\n' "$f" "$name"; done
+            done < <(find tests/e2e_tests -name "test*.py") \
+              | jq -R -s -c 'split("\n") | map(select(. != ""))'
+          )
+          echo "Collected $(echo "$test_cases" | jq 'length') test cases"
+          echo "test-cases=$test_cases" >> $GITHUB_OUTPUT
         shell: bash
 
   pull-docker-image:
@@ -123,7 +138,7 @@ jobs:
       - find-e2e-tests
 
     runs-on: ubuntu-latest
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     steps:
       - name: Log in to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
@@ -140,52 +155,17 @@ jobs:
           name: subtensor-localnet
           path: subtensor-localnet.tar
 
-  run-e2e-tests:
+  build-e2e-image:
+    # Build the test environment (system deps + bittensor[dev] + this PR's
+    # async-substrate-interface) into a single image ONCE per run, so the e2e
+    # matrix jobs below just pull it and run pytest — no per-test setup.
     needs:
       - check-labels
-      - find-e2e-tests
-      - pull-docker-image
-
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 16
-      matrix:
-        rust-branch:
-          - stable
-        rust-target:
-          - x86_64-unknown-linux-gnu
-        os:
-          - ubuntu-latest
-        test-file: ${{ fromJson(needs.find-e2e-tests.outputs.test-files) }}
-
-    env:
-      RELEASE_NAME: development
-      RUSTV: ${{ matrix.rust-branch }}
-      RUST_BACKTRACE: full
-      RUST_BIN_DIR: target/${{ matrix.rust-target }}
-      TARGET: ${{ matrix.rust-target }}
-
-    timeout-minutes: 60
-    name: "e2e tests: ${{ matrix.test-file }}"
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
-      - name: Check-out repository
-        uses: actions/checkout@v6
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update &&
-          sudo apt-get install -y clang curl libssl-dev llvm libudev-dev protobuf-compiler
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
       - name: Clone Bittensor SDK repo
         run: git clone https://github.com/latent-to/bittensor.git
 
@@ -199,10 +179,6 @@ jobs:
           git checkout FETCH_HEAD
           echo "✅ Using Bittensor branch: $BITTENSOR_BRANCH"
 
-      - name: Install Bittensor SDK dependencies
-        working-directory: ${{ github.workspace }}/bittensor
-        run: uv pip install --system '.[dev]'
-
       - name: Clone async-substrate-interface repo
         run: git clone https://github.com/latent-to/async-substrate-interface.git
 
@@ -215,11 +191,99 @@ jobs:
           git checkout FETCH_HEAD
           echo "Current SHA: $(git rev-parse HEAD)"
 
-      - name: Install async-substrate-interface with dev dependencies
-        working-directory: ${{ github.workspace }}/async-substrate-interface
+      - name: Write Dockerfile
         run: |
-          uv pip uninstall --system async-substrate-interface || true
-          uv pip install --system '.[dev]'
+          # Exclude the (large) .git dirs from the build context.
+          printf '**/.git\n' > .dockerignore
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.13-slim
+
+          # System deps: build toolchain for any source wheels, curl for the docker CLI
+          # download below, and git for any VCS-based installs.
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                clang curl libssl-dev llvm libudev-dev protobuf-compiler git \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Static Docker CLI (client only). The e2e fixtures shell out to `docker` to
+          # launch the localnet via the mounted host socket; installing the static binary
+          # to /usr/local/bin guarantees it is on PATH regardless of the base distro's
+          # packaging (the `docker.io` apt package did not reliably provide it). The final
+          # `docker --version` fails the build early if the CLI is ever missing.
+          ARG DOCKER_CLI_VERSION=27.5.1
+          RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+                | tar -xz -C /usr/local/bin --strip-components=1 docker/docker \
+              && docker --version
+
+          RUN pip install --no-cache-dir uv
+
+          COPY bittensor /opt/bittensor
+          COPY async-substrate-interface /opt/async-substrate-interface
+
+          # Install the SDK with dev extras, then overlay this PR's build of
+          # async-substrate-interface so the tests exercise the PR code.
+          RUN uv pip install --system '/opt/bittensor[dev]' \
+              && (uv pip uninstall --system async-substrate-interface || true) \
+              && uv pip install --system /opt/async-substrate-interface
+
+          # pytest is invoked from here so the relative `tests/e2e_tests/...` node ids resolve.
+          WORKDIR /opt/bittensor
+          DOCKERFILE
+
+      - name: Set image ref
+        id: meta
+        # A plain local tag (no registry): the image is shipped to the matrix jobs as a
+        # `docker save` tarball artifact, not via a registry push.
+        run: echo "image=async-substrate-interface-e2e:${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
+
+      - name: Save image to tarball
+        # Distribute via a GitHub artifact (fast internal transport, same as the localnet
+        # image) instead of GHCR, which avoids slow registry pulls across all matrix jobs,
+        # registry rate-limits, and the fork-PR push-permission problem.
+        run: docker save -o e2e-image.tar "${{ steps.meta.outputs.image }}"
+
+      - name: Upload image as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-image
+          path: e2e-image.tar
+
+  run-e2e-tests:
+    needs:
+      - check-labels
+      - find-e2e-tests
+      - pull-docker-image
+      - build-e2e-image
+
+    # Only fan out the matrix if every input-producing dependency succeeded — otherwise
+    # all 139 jobs would spawn only to fail (missing image/localnet artifact, or no
+    # test list). !cancelled() alone would let them run on upstream failure.
+    if: >-
+      ${{ !cancelled()
+      && needs.check-labels.outputs.run-sdk-tests == 'true'
+      && needs.find-e2e-tests.result == 'success'
+      && needs.pull-docker-image.result == 'success'
+      && needs.build-e2e-image.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 64
+      matrix:
+        test-case: ${{ fromJson(needs.find-e2e-tests.outputs.test-cases) }}
+
+    timeout-minutes: 60
+    name: "e2e tests: ${{ matrix.test-case }}"
+    steps:
+      - name: Download prebuilt test image
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-image
+
+      - name: Load prebuilt test image
+        run: docker load -i e2e-image.tar
 
       - name: Download Cached Docker Image
         uses: actions/download-artifact@v8
@@ -229,14 +293,31 @@ jobs:
       - name: Load Docker Image
         run: docker load -i subtensor-localnet.tar
 
+      # The job stays on the bare runner (no `container:`), so we can launch the test
+      # container ourselves with `--network host` — GitHub injects its own network into
+      # job containers, which conflicts with host mode. Host networking + the mounted
+      # docker socket let the e2e fixtures start the localnet (published on the host's
+      # :9944) and reach it at ws://localhost:9944. All deps are baked into the image,
+      # so there is no per-test apt/clone/install.
       - name: Run e2e tests
-        run: pytest ${{ matrix.test-file }} -s
+        # --reruns retries a flaky test (e.g. when the localnet is listening but its RPC
+        # isn't ready yet, surfacing as a websocket InvalidMessage during connect). The
+        # whole test reruns, re-spinning the localnet fixture, so by the retry the node
+        # is ready. pytest-rerunfailures ships with bittensor[dev].
+        run: |
+          docker run --rm \
+            --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /opt/bittensor \
+            -e SKIP_PULL=1 \
+            "${{ needs.build-e2e-image.outputs.image }}" \
+            pytest "${{ matrix.test-case }}" -s --reruns 2 --reruns-delay 5
 
 
   run-integration-and-unit-test:
     needs:
       - check-labels
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check-out repository
