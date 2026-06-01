@@ -3,6 +3,7 @@ name: Bittensor SDK Test
 permissions:
   pull-requests: write
   contents: read
+  packages: write
 
 concurrency:
   group: e2e-sdk-${{ github.ref }}
@@ -155,14 +156,104 @@ jobs:
           name: subtensor-localnet
           path: subtensor-localnet.tar
 
+  build-e2e-image:
+    # Build the test environment (system deps + bittensor[dev] + this PR's
+    # async-substrate-interface) into a single image ONCE per run, so the e2e
+    # matrix jobs below just pull it and run pytest — no per-test setup.
+    needs:
+      - check-labels
+    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Clone Bittensor SDK repo
+        run: git clone https://github.com/latent-to/bittensor.git
+
+      - name: Checkout Bittensor branch
+        working-directory: ${{ github.workspace }}/bittensor
+        run: |
+          if ! git fetch origin $BITTENSOR_BRANCH; then
+            echo "❌ Error: Branch '$BITTENSOR_BRANCH' does not exist in latent-to/bittensor."
+            exit 1
+          fi
+          git checkout FETCH_HEAD
+          echo "✅ Using Bittensor branch: $BITTENSOR_BRANCH"
+
+      - name: Clone async-substrate-interface repo
+        run: git clone https://github.com/latent-to/async-substrate-interface.git
+
+      - name: Checkout PR branch in async-substrate-interface
+        working-directory: ${{ github.workspace }}/async-substrate-interface
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref || github.ref_name }}"
+          REPO_URL="${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/latent-to/async-substrate-interface.git' }}"
+          git fetch $REPO_URL $BRANCH
+          git checkout FETCH_HEAD
+          echo "Current SHA: $(git rev-parse HEAD)"
+
+      - name: Write Dockerfile
+        run: |
+          # Exclude the (large) .git dirs from the build context.
+          printf '**/.git\n' > .dockerignore
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM python:3.13-slim
+
+          # System deps: build toolchain for any source wheels, the docker CLI so the
+          # e2e fixtures can launch the subtensor-localnet container (docker-out-of-docker),
+          # and git for any VCS-based installs.
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                clang curl libssl-dev llvm libudev-dev protobuf-compiler git docker.io \
+              && rm -rf /var/lib/apt/lists/*
+
+          RUN pip install --no-cache-dir uv
+
+          COPY bittensor /opt/bittensor
+          COPY async-substrate-interface /opt/async-substrate-interface
+
+          # Install the SDK with dev extras, then overlay this PR's build of
+          # async-substrate-interface so the tests exercise the PR code.
+          RUN uv pip install --system '/opt/bittensor[dev]' \
+              && (uv pip uninstall --system async-substrate-interface || true) \
+              && uv pip install --system /opt/async-substrate-interface
+
+          # pytest is invoked from here so the relative `tests/e2e_tests/...` node ids resolve.
+          WORKDIR /opt/bittensor
+          DOCKERFILE
+
+      - name: Set image ref
+        id: meta
+        run: echo "image=ghcr.io/${{ github.repository }}/e2e:${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+
+      - name: Build and push image
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}" .
+          docker push "${{ steps.meta.outputs.image }}"
+
   run-e2e-tests:
     needs:
       - check-labels
       - find-e2e-tests
       - pull-docker-image
+      - build-e2e-image
 
     if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
     runs-on: ubuntu-latest
+
+    # Run each test inside the prebuilt image: all deps are already installed, so
+    # there is no per-test apt/clone/install. Docker-out-of-docker (mounted host
+    # socket) + host networking let the e2e fixtures launch the localnet container
+    # and reach it at ws://localhost:9944, just as on a bare runner.
+    container:
+      image: ${{ needs.build-e2e-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --network host -v /var/run/docker.sock:/var/run/docker.sock
+
     strategy:
       fail-fast: false
       max-parallel: 16
@@ -170,11 +261,9 @@ jobs:
         test-case: ${{ fromJson(needs.find-e2e-tests.outputs.test-cases) }}
 
     env:
-      RELEASE_NAME: development
-      RUSTV: ${{ matrix.rust-branch }}
-      RUST_BACKTRACE: full
-      RUST_BIN_DIR: target/${{ matrix.rust-target }}
-      TARGET: ${{ matrix.rust-target }}
+      # The localnet image is preloaded from the cached tar below; skip the
+      # fixture's own `docker pull`.
+      SKIP_PULL: "1"
 
     timeout-minutes: 60
     name: "e2e tests: ${{ matrix.test-case }}"
