@@ -4288,7 +4288,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
     async def get_block_number(self, block_hash: Optional[str] = None) -> int:
         """Async version of `substrateinterface.base.get_block_number` method."""
         if block_hash is None:
-            return await self._get_block_number(None)
+            return await self._get_current_block_number()
         if (block := self.runtime_cache.blocks_reverse.get(block_hash)) is not None:
             return block
         block = await self._cached_get_block_number(block_hash)
@@ -4302,6 +4302,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
         as is the case with DiskCachedAsyncSubstrateInterface._cached_get_block_number
         """
         return await self._get_block_number(block_hash=block_hash)
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _get_current_block_number(self) -> int:
+        response = await self.rpc_request("chain_getHeader", [None])
+        return int(response["result"]["number"], 16)
 
     async def _get_block_number(self, block_hash: Optional[str]) -> int:
         response = await self.rpc_request("chain_getHeader", [block_hash])
