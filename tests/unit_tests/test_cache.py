@@ -2,7 +2,7 @@ import asyncio
 import pytest
 from unittest import mock
 
-from async_substrate_interface.utils.cache import CachedFetcher
+from async_substrate_interface.utils.cache import CachedFetcher, cached_fetcher
 
 
 @pytest.mark.asyncio
@@ -88,3 +88,119 @@ async def test_cached_fetcher_eviction():
     assert "key1" not in fetcher._cache.cache
     assert "key2" in fetcher._cache.cache
     assert "key3" in fetcher._cache.cache
+
+
+@pytest.mark.asyncio
+async def test_cached_fetcher_cache_results_false_does_not_memoize():
+    """With cache_results=False, results are never stored, so each sequential call re-fetches."""
+    calls = 0
+
+    async def method(x):
+        nonlocal calls
+        calls += 1
+        return f"result_{x}_{calls}"
+
+    fetcher = CachedFetcher(max_size=2, method=method, cache_results=False)
+
+    result1 = await fetcher("key1")
+    result2 = await fetcher("key1")
+
+    # The stale value is never memoized, so the second call re-fetches.
+    assert calls == 2
+    assert result1 != result2
+    # Nothing is stored in the LRU.
+    assert len(fetcher._cache.cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_cached_fetcher_cache_results_false_still_dedups_inflight():
+    """With cache_results=False, concurrent calls still share a single in-flight future."""
+    calls = 0
+    event = asyncio.Event()
+
+    async def slow_method(x):
+        nonlocal calls
+        calls += 1
+        await event.wait()
+        return f"slow_{x}_{calls}"
+
+    fetcher = CachedFetcher(max_size=2, method=slow_method, cache_results=False)
+
+    # Two concurrent requests for the same key while the first is in-flight.
+    task1 = asyncio.create_task(fetcher("key1"))
+    task2 = asyncio.create_task(fetcher("key1"))
+    await asyncio.sleep(0.1)
+
+    event.set()
+    result1, result2 = await asyncio.gather(task1, task2)
+
+    # Shared a single I/O despite not being cached.
+    assert result1 == result2 == "slow_key1_1"
+    assert calls == 1
+
+    # The in-flight future is gone, so a later call re-fetches (no memoization).
+    result3 = await fetcher("key1")
+    assert calls == 2
+    assert result3 == "slow_key1_2"
+
+
+@pytest.mark.asyncio
+async def test_cached_fetcher_decorator_no_arg_dedup_only():
+    """Mirrors get_chain_head: a no-arg method that dedups concurrent calls but never memoizes."""
+
+    class Chain:
+        def __init__(self):
+            self.calls = 0
+            self.event = asyncio.Event()
+
+        @cached_fetcher(cache_key_index=None, cache_results=False)
+        async def get_head(self):
+            self.calls += 1
+            await self.event.wait()
+            return f"head_{self.calls}"
+
+    chain = Chain()
+
+    # Concurrent calls collapse to a single I/O.
+    task1 = asyncio.create_task(chain.get_head())
+    task2 = asyncio.create_task(chain.get_head())
+    await asyncio.sleep(0.1)
+    chain.event.set()
+    result1, result2 = await asyncio.gather(task1, task2)
+    assert result1 == result2 == "head_1"
+    assert chain.calls == 1
+
+    # A later call re-fetches the (now stale) chaintip rather than returning a cached value.
+    result3 = await chain.get_head()
+    assert result3 == "head_2"
+    assert chain.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cached_fetcher_decorator_memoizes_by_default():
+    """The cached_fetcher decorator memoizes per-instance by default (cache_results=True)."""
+
+    class Chain:
+        def __init__(self):
+            self.calls = 0
+
+        @cached_fetcher(max_size=8)
+        async def fetch(self, key):
+            self.calls += 1
+            return f"{key}_{self.calls}"
+
+    chain = Chain()
+    result1 = await chain.fetch("a")
+    result2 = await chain.fetch("a")
+    # Second call with the same key is served from the cache.
+    assert result1 == result2 == "a_1"
+    assert chain.calls == 1
+
+    # A new key triggers a fetch.
+    await chain.fetch("b")
+    assert chain.calls == 2
+
+    # Caches are isolated per-instance.
+    other = Chain()
+    await other.fetch("a")
+    assert other.calls == 1

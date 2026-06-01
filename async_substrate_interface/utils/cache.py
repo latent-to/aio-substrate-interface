@@ -532,6 +532,7 @@ class CachedFetcher:
         max_size: int,
         method: Callable[..., Awaitable[Any]],
         cache_key_index: Optional[int] = 0,
+        cache_results: bool = True,
     ):
         """
         Args:
@@ -539,12 +540,16 @@ class CachedFetcher:
             method: the function to cache
             cache_key_index: if the method takes multiple args, this is the index of that cache key in the args list
                 (default is the first arg). By setting this to `None`, it will use all args as the cache key.
+            cache_results: whether to memoize results in the LRU cache. When `False`, concurrent calls still share
+                a single in-flight future (so they de-duplicate to one I/O), but the result is never stored — a
+                later call re-fetches. Use this for values that go stale, such as the chaintip from `get_chain_head`.
         """
         self._inflight: dict[Hashable, asyncio.Future] = {}
         self._method = method
         self._max_size = max_size
         self._cache = LRUCache(max_size=max_size)
         self._cache_key_index = cache_key_index
+        self._cache_results = cache_results
 
     def make_cache_key(self, args: tuple, kwargs: dict) -> Hashable:
         bound = inspect.signature(self._method).bind(*args, **kwargs)
@@ -559,7 +564,7 @@ class CachedFetcher:
     async def __call__(self, *args: Any, **kwargs: Any) -> Any:
         key = self.make_cache_key(args, kwargs)
 
-        if item := self._cache.get(key):
+        if self._cache_results and (item := self._cache.get(key)) is not None:
             return item
 
         if key in self._inflight:
@@ -571,7 +576,8 @@ class CachedFetcher:
 
         try:
             result = await self._method(*args, **kwargs)
-            self._cache.set(key, result)
+            if self._cache_results:
+                self._cache.set(key, result)
             future.set_result(result)
             return result
         except Exception:
@@ -609,10 +615,17 @@ class _CachedFetcherMethod:
     Helper class for using CachedFetcher with method caches (rather than functions)
     """
 
-    def __init__(self, method, max_size: int, cache_key_index: int):
+    def __init__(
+        self,
+        method,
+        max_size: int,
+        cache_key_index: int,
+        cache_results: bool = True,
+    ):
         self.method = method
         self.max_size = max_size
         self.cache_key_index = cache_key_index
+        self.cache_results = cache_results
         # Use WeakKeyDictionary to avoid preventing garbage collection of instances
         self._instances: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -629,14 +642,19 @@ class _CachedFetcherMethod:
                 max_size=self.max_size,
                 method=weak_method,
                 cache_key_index=self.cache_key_index,
+                cache_results=self.cache_results,
             )
         return self._instances[instance]
 
 
-def cached_fetcher(max_size: Optional[int] = None, cache_key_index: Optional[int] = 0):
+def cached_fetcher(
+    max_size: Optional[int] = None,
+    cache_key_index: Optional[int] = 0,
+    cache_results: bool = True,
+):
     """Wrapper for CachedFetcher. See example in CachedFetcher docstring."""
 
     def wrapper(method):
-        return _CachedFetcherMethod(method, max_size, cache_key_index)
+        return _CachedFetcherMethod(method, max_size, cache_key_index, cache_results)
 
     return wrapper
