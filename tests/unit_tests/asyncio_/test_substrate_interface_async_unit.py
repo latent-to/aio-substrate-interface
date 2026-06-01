@@ -224,14 +224,14 @@ class TestGetBlockNumber:
         s = AsyncSubstrateInterface("ws://localhost", _mock=True)
         s.runtime_cache = MagicMock()
         s._cached_get_block_number = AsyncMock(return_value=100)
-        s._get_block_number = AsyncMock(return_value=99)
+        s._get_current_block_number = AsyncMock(return_value=99)
         return s
 
     @pytest.mark.asyncio
-    async def test_none_block_hash_calls_get_block_number_directly(self, substrate):
+    async def test_none_block_hash_calls_get_current_block_number(self, substrate):
         result = await substrate.get_block_number(None)
         assert result == 99
-        substrate._get_block_number.assert_awaited_once_with(None)
+        substrate._get_current_block_number.assert_awaited_once_with()
         substrate._cached_get_block_number.assert_not_awaited()
 
     @pytest.mark.asyncio
