@@ -150,6 +150,29 @@ see [GitHub's documentation on signing commits](https://docs.github.com/en/authe
 
 > **Note:** Pull requests containing unsigned commits will not be merged.
 
+## Cyscale Installation Issue
+
+Because cyscale uses the same namespace as py-scale-codec (scalecodec), there can be some difficulties with
+upgrades.
+
+First try the basic
+
+```shell
+pip uninstall scalecodec cyscale -y
+pip install -U cyscale --force-reinstall
+```
+
+If this does not work, it usually means you have other dependent packages (usually bittensor and/or bittensor-cli).
+Reinstalling these should resolve your issues:
+
+```shell
+pip uninstall scalecodec cyscale bittensor bittensor-cli -y
+# only one of the following is required
+pip install -U bittensor[cli] --force-reinstall  # for both bittensor SDK and CLI
+pip install -U bittensor-cli --force-reinstall   # for just bittensor CLI (btcli)
+pip install -U bittensor --force-reinstall       # for just bittensor SDK
+```
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
