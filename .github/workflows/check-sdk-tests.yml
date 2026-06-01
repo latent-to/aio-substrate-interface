@@ -292,6 +292,10 @@ jobs:
       # :9944) and reach it at ws://localhost:9944. All deps are baked into the image,
       # so there is no per-test apt/clone/install.
       - name: Run e2e tests
+        # --reruns retries a flaky test (e.g. when the localnet is listening but its RPC
+        # isn't ready yet, surfacing as a websocket InvalidMessage during connect). The
+        # whole test reruns, re-spinning the localnet fixture, so by the retry the node
+        # is ready. pytest-rerunfailures ships with bittensor[dev].
         run: |
           docker run --rm \
             --network host \
@@ -299,7 +303,7 @@ jobs:
             -w /opt/bittensor \
             -e SKIP_PULL=1 \
             "${{ needs.build-e2e-image.outputs.image }}" \
-            pytest "${{ matrix.test-case }}" -s
+            pytest "${{ matrix.test-case }}" -s --reruns 2 --reruns-delay 5
 
 
   run-integration-and-unit-test:
