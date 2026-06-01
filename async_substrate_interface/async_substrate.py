@@ -2817,6 +2817,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
     async def _get_block_hash(self, block_id: Optional[int]) -> str:
         return (await self.rpc_request("chain_getBlockHash", [block_id]))["result"]
 
+    @cached_fetcher(cache_key_index=None, cache_results=False)
     async def get_chain_head(self) -> str:
         response = await self._make_rpc_request(
             [
@@ -3268,6 +3269,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         return extrinsic
 
+    @cached_fetcher(cache_key_index=None, cache_results=False)
     async def get_chain_finalised_head(self) -> str:
         """
         A pass-though to existing JSONRPC method `chain_getFinalizedHead`
