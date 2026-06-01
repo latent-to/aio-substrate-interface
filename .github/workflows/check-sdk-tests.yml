@@ -3,7 +3,6 @@ name: Bittensor SDK Test
 permissions:
   pull-requests: write
   contents: read
-  packages: write
 
 concurrency:
   group: e2e-sdk-${{ github.ref }}
@@ -232,15 +231,24 @@ jobs:
 
       - name: Set image ref
         id: meta
-        run: echo "image=ghcr.io/${{ github.repository }}/e2e:${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
+        # A plain local tag (no registry): the image is shipped to the matrix jobs as a
+        # `docker save` tarball artifact, not via a registry push.
+        run: echo "image=async-substrate-interface-e2e:${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_OUTPUT
 
-      - name: Log in to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
 
-      - name: Build and push image
-        run: |
-          docker build -t "${{ steps.meta.outputs.image }}" .
-          docker push "${{ steps.meta.outputs.image }}"
+      - name: Save image to tarball
+        # Distribute via a GitHub artifact (fast internal transport, same as the localnet
+        # image) instead of GHCR, which avoids slow registry pulls across all matrix jobs,
+        # registry rate-limits, and the fork-PR push-permission problem.
+        run: docker save -o e2e-image.tar "${{ steps.meta.outputs.image }}"
+
+      - name: Upload image as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-image
+          path: e2e-image.tar
 
   run-e2e-tests:
     needs:
@@ -261,11 +269,13 @@ jobs:
     timeout-minutes: 60
     name: "e2e tests: ${{ matrix.test-case }}"
     steps:
-      - name: Log in to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+      - name: Download prebuilt test image
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-image
 
-      - name: Pull prebuilt test image
-        run: docker pull "${{ needs.build-e2e-image.outputs.image }}"
+      - name: Load prebuilt test image
+        run: docker load -i e2e-image.tar
 
       - name: Download Cached Docker Image
         uses: actions/download-artifact@v8
