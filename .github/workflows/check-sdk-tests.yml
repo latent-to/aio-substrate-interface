@@ -243,31 +243,21 @@ jobs:
     if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
     runs-on: ubuntu-latest
 
-    # Run each test inside the prebuilt image: all deps are already installed, so
-    # there is no per-test apt/clone/install. Docker-out-of-docker (mounted host
-    # socket) + host networking let the e2e fixtures launch the localnet container
-    # and reach it at ws://localhost:9944, just as on a bare runner.
-    container:
-      image: ${{ needs.build-e2e-image.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --network host -v /var/run/docker.sock:/var/run/docker.sock
-
     strategy:
       fail-fast: false
       max-parallel: 16
       matrix:
         test-case: ${{ fromJson(needs.find-e2e-tests.outputs.test-cases) }}
 
-    env:
-      # The localnet image is preloaded from the cached tar below; skip the
-      # fixture's own `docker pull`.
-      SKIP_PULL: "1"
-
     timeout-minutes: 60
     name: "e2e tests: ${{ matrix.test-case }}"
     steps:
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+
+      - name: Pull prebuilt test image
+        run: docker pull "${{ needs.build-e2e-image.outputs.image }}"
+
       - name: Download Cached Docker Image
         uses: actions/download-artifact@v8
         with:
@@ -276,9 +266,21 @@ jobs:
       - name: Load Docker Image
         run: docker load -i subtensor-localnet.tar
 
+      # The job stays on the bare runner (no `container:`), so we can launch the test
+      # container ourselves with `--network host` — GitHub injects its own network into
+      # job containers, which conflicts with host mode. Host networking + the mounted
+      # docker socket let the e2e fixtures start the localnet (published on the host's
+      # :9944) and reach it at ws://localhost:9944. All deps are baked into the image,
+      # so there is no per-test apt/clone/install.
       - name: Run e2e tests
-        working-directory: /opt/bittensor
-        run: pytest "${{ matrix.test-case }}" -s
+        run: |
+          docker run --rm \
+            --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /opt/bittensor \
+            -e SKIP_PULL=1 \
+            "${{ needs.build-e2e-image.outputs.image }}" \
+            pytest "${{ matrix.test-case }}" -s
 
 
   run-integration-and-unit-test:
