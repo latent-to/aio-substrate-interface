@@ -55,7 +55,7 @@ jobs:
   check-labels:
     needs: apply-label-to-new-pr
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     outputs:
       run-sdk-tests: ${{ steps.check-manual.outputs.run-sdk-tests || steps.get-labels-pr.outputs.run-sdk-tests }}
     steps:
@@ -88,7 +88,7 @@ jobs:
 
   find-e2e-tests:
     needs: check-labels
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       test-cases: ${{ steps.get-tests.outputs.test-cases }}
@@ -138,7 +138,7 @@ jobs:
       - find-e2e-tests
 
     runs-on: ubuntu-latest
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     steps:
       - name: Log in to GitHub Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
@@ -161,7 +161,7 @@ jobs:
     # matrix jobs below just pull it and run pytest — no per-test setup.
     needs:
       - check-labels
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -257,7 +257,7 @@ jobs:
       - pull-docker-image
       - build-e2e-image
 
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -309,7 +309,7 @@ jobs:
   run-integration-and-unit-test:
     needs:
       - check-labels
-    if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
+    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check-out repository
