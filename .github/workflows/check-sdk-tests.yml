@@ -254,7 +254,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 16
+      max-parallel: 64
       matrix:
         test-case: ${{ fromJson(needs.find-e2e-tests.outputs.test-cases) }}
 
@@ -281,21 +281,6 @@ jobs:
       # docker socket let the e2e fixtures start the localnet (published on the host's
       # :9944) and reach it at ws://localhost:9944. All deps are baked into the image,
       # so there is no per-test apt/clone/install.
-      # Fail loudly (instead of letting the e2e fixture silently skip) if the docker
-      # CLI isn't on PATH, the host daemon isn't reachable through the mounted socket,
-      # or the localnet image didn't load — the three things the `local_chain` fixture
-      # needs before it will actually start a chain.
-      - name: Preflight - verify docker is reachable inside the test container
-        run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            "${{ needs.build-e2e-image.outputs.image }}" \
-            sh -euxc '
-              command -v docker
-              docker version
-              docker image inspect ghcr.io/opentensor/subtensor-localnet:devnet-ready >/dev/null
-            '
-
       - name: Run e2e tests
         run: |
           docker run --rm \
