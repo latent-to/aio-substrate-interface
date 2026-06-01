@@ -257,7 +257,15 @@ jobs:
       - pull-docker-image
       - build-e2e-image
 
-    if: ${{ !cancelled() && needs.check-labels.outputs.run-sdk-tests == 'true' }}
+    # Only fan out the matrix if every input-producing dependency succeeded — otherwise
+    # all 139 jobs would spawn only to fail (missing image/localnet artifact, or no
+    # test list). !cancelled() alone would let them run on upstream failure.
+    if: >-
+      ${{ !cancelled()
+      && needs.check-labels.outputs.run-sdk-tests == 'true'
+      && needs.find-e2e-tests.result == 'success'
+      && needs.pull-docker-image.result == 'success'
+      && needs.build-e2e-image.result == 'success' }}
     runs-on: ubuntu-latest
 
     strategy:
