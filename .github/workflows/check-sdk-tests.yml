@@ -91,7 +91,7 @@ jobs:
     if: always() && needs.check-labels.outputs.run-sdk-tests == 'true'
     runs-on: ubuntu-latest
     outputs:
-      test-files: ${{ steps.get-tests.outputs.test-files }}
+      test-cases: ${{ steps.get-tests.outputs.test-cases }}
     steps:
       - name: Research preparation
         working-directory: ${{ github.workspace }}
@@ -110,11 +110,26 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install -y jq
 
-      - name: Find e2e test files
+      - name: Find e2e test cases
         id: get-tests
         run: |
-          test_files=$(find ${{ github.workspace }}/bittensor/tests/e2e_tests -name "test*.py" | jq -R -s -c 'split("\n") | map(select(. != ""))')
-          echo "test-files=$test_files" >> $GITHUB_OUTPUT
+          # Emit one matrix entry per individual test function (as a `path::test_name`
+          # node id) rather than per file, so each test gets its own concurrent job.
+          # The e2e suite has no test classes, so grepping top-level `def test_*` is
+          # sufficient and keeps this job dependency-free (no pytest collection needed).
+          # Node ids are relative to the bittensor repo root so they resolve inside the
+          # prebuilt image (where bittensor lives at /opt/bittensor), not the workspace.
+          cd "${{ github.workspace }}/bittensor"
+          test_cases=$(
+            while IFS= read -r f; do
+              grep -oE '^(async[[:space:]]+)?def[[:space:]]+test_[A-Za-z0-9_]+' "$f" \
+                | grep -oE 'test_[A-Za-z0-9_]+' \
+                | while IFS= read -r name; do printf '%s::%s\n' "$f" "$name"; done
+            done < <(find tests/e2e_tests -name "test*.py") \
+              | jq -R -s -c 'split("\n") | map(select(. != ""))'
+          )
+          echo "Collected $(echo "$test_cases" | jq 'length') test cases"
+          echo "test-cases=$test_cases" >> $GITHUB_OUTPUT
         shell: bash
 
   pull-docker-image:
@@ -152,13 +167,7 @@ jobs:
       fail-fast: false
       max-parallel: 16
       matrix:
-        rust-branch:
-          - stable
-        rust-target:
-          - x86_64-unknown-linux-gnu
-        os:
-          - ubuntu-latest
-        test-file: ${{ fromJson(needs.find-e2e-tests.outputs.test-files) }}
+        test-case: ${{ fromJson(needs.find-e2e-tests.outputs.test-cases) }}
 
     env:
       RELEASE_NAME: development
@@ -168,59 +177,8 @@ jobs:
       TARGET: ${{ matrix.rust-target }}
 
     timeout-minutes: 60
-    name: "e2e tests: ${{ matrix.test-file }}"
+    name: "e2e tests: ${{ matrix.test-case }}"
     steps:
-      - name: Check-out repository
-        uses: actions/checkout@v6
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update &&
-          sudo apt-get install -y clang curl libssl-dev llvm libudev-dev protobuf-compiler
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: Clone Bittensor SDK repo
-        run: git clone https://github.com/latent-to/bittensor.git
-
-      - name: Checkout Bittensor branch
-        working-directory: ${{ github.workspace }}/bittensor
-        run: |
-          if ! git fetch origin $BITTENSOR_BRANCH; then
-            echo "❌ Error: Branch '$BITTENSOR_BRANCH' does not exist in latent-to/bittensor."
-            exit 1
-          fi
-          git checkout FETCH_HEAD
-          echo "✅ Using Bittensor branch: $BITTENSOR_BRANCH"
-
-      - name: Install Bittensor SDK dependencies
-        working-directory: ${{ github.workspace }}/bittensor
-        run: uv pip install --system '.[dev]'
-
-      - name: Clone async-substrate-interface repo
-        run: git clone https://github.com/latent-to/async-substrate-interface.git
-
-      - name: Checkout PR branch in async-substrate-interface
-        working-directory: ${{ github.workspace }}/async-substrate-interface
-        run: |
-          BRANCH="${{ github.event.pull_request.head.ref || github.ref_name }}"
-          REPO_URL="${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/latent-to/async-substrate-interface.git' }}"
-          git fetch $REPO_URL $BRANCH
-          git checkout FETCH_HEAD
-          echo "Current SHA: $(git rev-parse HEAD)"
-
-      - name: Install async-substrate-interface with dev dependencies
-        working-directory: ${{ github.workspace }}/async-substrate-interface
-        run: |
-          uv pip uninstall --system async-substrate-interface || true
-          uv pip install --system '.[dev]'
-
       - name: Download Cached Docker Image
         uses: actions/download-artifact@v8
         with:
@@ -230,7 +188,8 @@ jobs:
         run: docker load -i subtensor-localnet.tar
 
       - name: Run e2e tests
-        run: pytest ${{ matrix.test-file }} -s
+        working-directory: /opt/bittensor
+        run: pytest "${{ matrix.test-case }}" -s
 
 
   run-integration-and-unit-test:
