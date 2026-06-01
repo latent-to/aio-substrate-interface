@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, ANY
 
 import pytest
@@ -251,6 +252,54 @@ class TestGetBlockNumber:
         substrate.runtime_cache.add_item.assert_called_once_with(
             block_hash="0xABC", block=100
         )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_block_hash_none_dedups_chain_head_request():
+    """
+    Concurrent operations that resolve the chaintip share a single RPC.
+
+    ``query(..., block_hash=None)`` delegates to ``init_runtime``, which (with no
+    block_hash) resolves the current block via ``get_chain_head``. Because
+    ``get_chain_head`` is a dedup-only cached_fetcher, gathering several such
+    operations should send only ONE ``chain_getHead`` request, not one per call.
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+
+    # Short-circuit init_runtime right after get_chain_head: pretend the runtime for
+    # the resolved version is already cached, so we exercise only the chaintip lookup.
+    substrate.runtime_cache = MagicMock()
+    substrate.runtime_cache.retrieve.return_value = MagicMock(name="runtime")
+    substrate.get_block_runtime_version_for = AsyncMock(return_value=1)
+
+    # Count the actual chain_getHead RPCs. A gate ensures both callers are in-flight
+    # before the first one resolves, so the second must dedup onto the first's future.
+    head_requests = 0
+    release = asyncio.Event()
+
+    async def fake_make_rpc_request(payloads, *args, **kwargs):
+        nonlocal head_requests
+        head_requests += 1
+        await release.wait()
+        return {"rpc_request": [{"result": "0xHEAD"}]}
+
+    substrate._make_rpc_request = fake_make_rpc_request
+
+    task1 = asyncio.create_task(substrate.init_runtime(block_hash=None))
+    task2 = asyncio.create_task(substrate.init_runtime(block_hash=None))
+    await asyncio.sleep(0.1)  # let both reach (and dedup at) get_chain_head
+
+    release.set()
+    await asyncio.gather(task1, task2)
+
+    # Two queries, but only one chain_getHead hit the wire.
+    assert head_requests == 1
+    assert substrate.last_block_hash == "0xHEAD"
+
+    # And once the in-flight batch resolves, the chaintip is NOT memoized: a later
+    # call issues a fresh request (it would otherwise go stale).
+    await substrate.get_chain_head()
+    assert head_requests == 2
 
 
 @pytest.mark.asyncio
