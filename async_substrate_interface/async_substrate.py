@@ -2817,8 +2817,17 @@ class AsyncSubstrateInterface(SubstrateMixin):
     async def _get_block_hash(self, block_id: Optional[int]) -> str:
         return (await self.rpc_request("chain_getBlockHash", [block_id]))["result"]
 
-    @cached_fetcher(cache_key_index=None, cache_results=False)
     async def get_chain_head(self) -> str:
+        return await self._cached_get_chain_head()
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _cached_get_chain_head(self) -> str:
+        """
+        Resolves the chaintip. Decorated as a dedup-only fetcher (never memoized, since the
+        chaintip goes stale) so that concurrent callers share a single `chain_getHead` request.
+        Kept separate from the public `get_chain_head` so the latter stays a plain coroutine
+        method — friendlier to introspection/mocking by downstream consumers.
+        """
         response = await self._make_rpc_request(
             [
                 self.make_payload(
@@ -3269,7 +3278,6 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         return extrinsic
 
-    @cached_fetcher(cache_key_index=None, cache_results=False)
     async def get_chain_finalised_head(self) -> str:
         """
         A pass-though to existing JSONRPC method `chain_getFinalizedHead`
@@ -3277,6 +3285,12 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Returns:
             Hash of the most-recently finalized block
         """
+        return await self._cached_get_chain_finalised_head()
+
+    @cached_fetcher(cache_key_index=None, cache_results=False)
+    async def _cached_get_chain_finalised_head(self) -> str:
+        # Dedup-only fetcher (see `_cached_get_chain_head`): the finalized head advances, so it
+        # is never memoized, but concurrent callers still share a single request.
         response = await self.rpc_request("chain_getFinalizedHead", [])
         return response["result"]
 
