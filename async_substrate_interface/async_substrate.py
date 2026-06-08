@@ -2579,7 +2579,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 q = query_value
             decoded = await self.decode_scale(value_scale_type, q, runtime=runtime)
             result = decoded
-        if asyncio.iscoroutinefunction(result_handler):
+        if inspect.iscoroutinefunction(result_handler):
             # For multipart responses as a result of subscriptions.
             message, bool_result = await result_handler(result, subscription_id)  # type: ignore[arg-type]
             return message, bool_result
@@ -2637,11 +2637,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 for item_id in request_manager.unresponded():
                     if (
                         item_id not in request_manager.responses
-                        or asyncio.iscoroutinefunction(result_handler)
+                        or inspect.iscoroutinefunction(result_handler)
                     ):
                         if response := await ws.retrieve(item_id):
                             if (
-                                asyncio.iscoroutinefunction(result_handler)
+                                inspect.iscoroutinefunction(result_handler)
                                 and not subscription_added
                             ):
                                 # handles subscriptions, overwrites the previous mapping of {item_id : payload_id}
@@ -2670,7 +2670,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                             )
                             if (
                                 result_processor is not None
-                                and not asyncio.iscoroutinefunction(result_handler)
+                                and not inspect.iscoroutinefunction(result_handler)
                             ):
                                 decoded_response = result_processor(
                                     decoded_response, item_id
