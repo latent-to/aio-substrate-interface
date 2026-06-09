@@ -1702,6 +1702,48 @@ class AsyncSubstrateInterface(SubstrateMixin):
             metadata=runtime.metadata,
         )
 
+    async def create_storage_keys(
+        self,
+        pallet: str,
+        storage_function: str,
+        params: list[list],
+        block_hash: Optional[str] = None,
+    ) -> list[StorageKey]:
+        """
+        Creates a batch of storage keys with the same pallet/storage function, but with differing params.
+
+        Args:
+            pallet: name of pallet
+            storage_function: name of storage function
+            params: list of lists of parameters in case of a Mapped storage function
+            block_hash: the hash of the blockchain block whose runtime to use
+
+        Example:
+
+        ```
+        storage_keys = await substrate.create_storage_keys(
+            pallet="Balances",
+            storage_function="Account",
+            params=[
+                ["5gkods..."],
+                ["5jkgji..."],
+                ["5kdfni..."],
+            ],
+            block_hash="0xj9d3...",
+        ```
+
+        Returns:
+            list of StorageKeys
+        """
+        runtime = await self.init_runtime(block_hash=block_hash)
+        return StorageKey.create_from_storage_function_batch(
+            pallet,
+            storage_function,
+            params,
+            runtime_config=runtime.runtime_config,
+            metadata=runtime.metadata,
+        )
+
     async def subscribe_storage(
         self,
         storage_keys: list[StorageKey],

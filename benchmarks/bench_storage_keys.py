@@ -29,9 +29,7 @@ def main():
         ),
         "big",
     )
-    params_list = [
-        ["0x" + (base ^ i).to_bytes(32, "big").hex()] for i in range(N)
-    ]
+    params_list = [["0x" + (base ^ i).to_bytes(32, "big").hex()] for i in range(N)]
 
     # Full-batch correctness: every batch key must equal its per-key counterpart.
     batch = StorageKey.create_from_storage_function_batch(

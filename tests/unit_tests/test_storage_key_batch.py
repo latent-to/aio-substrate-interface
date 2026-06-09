@@ -35,14 +35,18 @@ class StorageKeyBatchTestCase(unittest.TestCase):
 
     def _per_key(self, pallet, sf, params):
         return StorageKey.create_from_storage_function(
-            pallet, sf, params,
+            pallet,
+            sf,
+            params,
             runtime_config=self.runtime_config,
             metadata=self.metadata,
         )
 
     def _batch(self, pallet, sf, params_list):
         return StorageKey.create_from_storage_function_batch(
-            pallet, sf, params_list,
+            pallet,
+            sf,
+            params_list,
             runtime_config=self.runtime_config,
             metadata=self.metadata,
         )
