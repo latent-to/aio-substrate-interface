@@ -8,6 +8,8 @@ shared connection ("poison pill").
 `send` acquired for it.
 - `discard_request` must release that permit, drop the pending future, and burn the id so a late node response can never
 be misrouted to a reused id.
+- A done future whose `result()` raises must not release its permit inside `retrieve`; the paired `discard_request`
+owns that single release, so a mid-flight transport error can never double-release the subscription semaphore.
 """
 
 import asyncio
@@ -188,3 +190,40 @@ async def test_discard_request_releases_permit_and_burns_id():
     permits_before = ws.max_subscriptions._value
     await ws.discard_request(item_id)
     assert ws.max_subscriptions._value == permits_before
+
+
+@pytest.mark.asyncio
+async def test_failed_retrieve_then_discard_releases_permit_once():
+    """
+    A done future whose `result()` raises must not release its permit in `retrieve`.
+
+    `retrieve` releases the permit only on the success path; on the exception path it leaves the still-pending id in
+    place so the caller's finally-block can hand it to `discard_request`, the single owner of that release. Releasing
+    inside `retrieve` here (the pre-fix order) would double-release the subscription semaphore once `discard_request`
+    runs.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    item_id = "Ab1"
+    fut = asyncio.get_running_loop().create_future()
+    fut.set_exception(ConnectionError("connection broke mid-flight"))
+    ws._received[item_id] = fut
+    ws._inflight[item_id] = '{"id": "Ab1"}'
+    ws._in_use_ids.add(item_id)
+    await ws.max_subscriptions.acquire()
+    permits_after_send = ws.max_subscriptions._value
+
+    # `retrieve` hits a done future whose `result()` raises. It must propagate that error WITHOUT releasing the permit,
+    # otherwise the paired `discard_request` would release a second time (the double-release this fix prevents).
+    with pytest.raises(ConnectionError, match="connection broke mid-flight"):
+        await ws.retrieve(item_id)
+
+    assert ws.max_subscriptions._value == permits_after_send
+    assert item_id in ws._received
+
+    # The callers' finally-block then discards the still-pending id, which is the single owner of that release.
+    await ws.discard_request(item_id)
+
+    assert ws.max_subscriptions._value == permits_after_send + 1
+    assert item_id not in ws._received
+    assert item_id not in ws._inflight
