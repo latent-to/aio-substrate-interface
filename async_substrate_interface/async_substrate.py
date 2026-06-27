@@ -1251,8 +1251,8 @@ class Websocket:
         item: Optional[asyncio.Future] = self._received.get(item_id)
         if item is not None:
             if item.done():
-                self.max_subscriptions.release()
                 res = item.result()
+                self.max_subscriptions.release()
                 del self._received[item_id]
                 return res
         else:
