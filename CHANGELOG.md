@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.1 /2026-06-29
+
+## What's Changed
+* Fix websocket poison connection and leaks on failed requests by @basfroman in https://github.com/latent-to/async-substrate-interface/pull/367
+
+**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v2.2.0...v2.2.1
+
 ## 2.2.0 /2026-06-11
 
 ## What's Changed
