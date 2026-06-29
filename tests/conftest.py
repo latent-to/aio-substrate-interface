@@ -1,8 +1,11 @@
+import os
 import subprocess
 from collections import namedtuple
 
 CONTAINER_NAME_PREFIX = "test_local_chain_"
-LOCALNET_IMAGE_NAME = "ghcr.io/opentensor/subtensor-localnet:devnet-ready"
+LOCALNET_IMAGE_NAME = os.getenv(
+    "LOCALNET_IMAGE_NAME", "ghcr.io/opentensor/subtensor-localnet:devnet-ready"
+)
 
 Container = namedtuple("Container", ["process", "name", "uri"])
 

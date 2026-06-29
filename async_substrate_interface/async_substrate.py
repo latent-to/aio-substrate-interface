@@ -641,9 +641,34 @@ class Websocket:
             return self.ws.state
 
     async def __aenter__(self):
+        await self._restart_handler_if_dead()
         if self.state not in (State.CONNECTING, State.OPEN):
             await self.connect()
         return self
+
+    async def _restart_handler_if_dead(self) -> None:
+        """
+        Revive the background send/recv handler if it has terminated.
+
+        When `_handler` finishes (for example by returning `TimeoutError("Max retries exceeded.")` after exhausting its
+        retries), the underlying socket may still be in the OPEN state. In that case neither `__aenter__` nor `connect`
+        recreate the handler, since both only act when the state is not OPEN/CONNECTING, so the connection is wedged
+        permanently and every `retrieve` re-raises the dead task's stored error. Detect that here and force a clean
+        reconnect (fresh socket and handler) under the lock.
+        """
+        task = self._send_recv_task
+        if task is None or not task.done():
+            return
+        async with self._lock:
+            task = self._send_recv_task
+            if task is None or not task.done():
+                # Another caller already revived the handler.
+                return
+            if not task.cancelled():
+                # Consume the dead task's outcome so it is not later reported as an unretrieved exception.
+                task.exception()
+            self._attempts = 0
+            await self._connect_internal(force=True)
 
     async def mark_waiting_for_response(self):
         """
@@ -1226,8 +1251,8 @@ class Websocket:
         item: Optional[asyncio.Future] = self._received.get(item_id)
         if item is not None:
             if item.done():
-                self.max_subscriptions.release()
                 res = item.result()
+                self.max_subscriptions.release()
                 del self._received[item_id]
                 return res
         else:
@@ -1252,6 +1277,23 @@ class Websocket:
                     logger.exception(f"Websocket sending exception: {e}")
                     raise e
         return None
+
+    async def discard_request(self, item_id: str) -> None:
+        """
+        Drop a request that never completed and release the subscription permit that `send` acquired for it.
+
+        This is idempotent and safe to call on ids that already completed:
+        `retrieve` removes those from `_received` after releasing their permit, so this becomes a no-op and never
+        double-releases. The id is deliberately not returned to `_in_use_ids`, so a late response from the node for it
+        is dropped by `_dispatch_response` (which checks `_received`) rather than misrouted to a reused id.
+        """
+        async with self._lock:
+            fut = self._received.pop(item_id, None)
+            self._inflight.pop(item_id, None)
+        if fut is not None:
+            self.max_subscriptions.release()
+            if not fut.done():
+                fut.cancel()
 
 
 class AsyncSubstrateInterface(SubstrateMixin):
@@ -2728,84 +2770,88 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         async with self.ws as ws:
             await ws.mark_waiting_for_response()
-            for payload in payloads:
-                item_id = await ws.send(payload["payload"])
-                request_manager.add_request(item_id, payload["id"])
-                # truncate to 2000 chars for debug logging
-                if len(stringified_payload := str(payload)) < 2_000:
-                    output_payload = stringified_payload
-                else:
-                    output_payload = f"{stringified_payload[:2_000]} (truncated)"
-                logger.debug(
-                    f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
-                )
+            try:
+                for payload in payloads:
+                    item_id = await ws.send(payload["payload"])
+                    request_manager.add_request(item_id, payload["id"])
+                    # truncate to 2000 chars for debug logging
+                    if len(stringified_payload := str(payload)) < 2_000:
+                        output_payload = stringified_payload
+                    else:
+                        output_payload = f"{stringified_payload[:2_000]} (truncated)"
+                    logger.debug(
+                        f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
+                    )
 
-            while True:
+                while True:
+                    for item_id in request_manager.unresponded():
+                        if (
+                            item_id not in request_manager.responses
+                            or inspect.iscoroutinefunction(result_handler)
+                        ):
+                            if response := await ws.retrieve(item_id):
+                                if (
+                                    inspect.iscoroutinefunction(result_handler)
+                                    and not subscription_added
+                                ):
+                                    # handles subscriptions, overwrites the previous mapping of {item_id : payload_id}
+                                    # with {subscription_id : payload_id}
+                                    try:
+                                        item_id = request_manager.overwrite_request(
+                                            item_id, response["result"]
+                                        )
+                                        subscription_added = True
+                                    except KeyError:
+                                        logger.error(
+                                            f"Error received from subtensor for {item_id}: {response}\n"
+                                            f"Currently received responses: {request_manager.get_results()}"
+                                        )
+                                        raise SubstrateRequestException(str(response))
+                                (
+                                    decoded_response,
+                                    complete,
+                                ) = await self._process_response(
+                                    response,
+                                    item_id,
+                                    value_scale_type,
+                                    storage_item,
+                                    result_handler,
+                                    runtime=runtime,
+                                )
+                                if (
+                                    result_processor is not None
+                                    and not inspect.iscoroutinefunction(result_handler)
+                                ):
+                                    decoded_response = result_processor(
+                                        decoded_response, item_id
+                                    )
+                                request_manager.add_response(
+                                    item_id, decoded_response, complete
+                                )
+                                # truncate to 2000 chars for debug logging
+                                if (
+                                    len(stringified_response := str(decoded_response))
+                                    < 2_000
+                                ):
+                                    output_response = stringified_response
+                                    # avoids clogging logs up needlessly (esp for Metadata stuff)
+                                else:
+                                    output_response = (
+                                        f"{stringified_response[:2_000]} (truncated)"
+                                    )
+                                logger.debug(
+                                    f"Received response for item ID {item_id}:\n{output_response}\n"
+                                    f"Complete: {complete}"
+                                )
+
+                    if request_manager.is_complete:
+                        break
+                    else:
+                        await asyncio.sleep(0.01)
+            finally:
+                await ws.mark_response_received()
                 for item_id in request_manager.unresponded():
-                    if (
-                        item_id not in request_manager.responses
-                        or inspect.iscoroutinefunction(result_handler)
-                    ):
-                        if response := await ws.retrieve(item_id):
-                            if (
-                                inspect.iscoroutinefunction(result_handler)
-                                and not subscription_added
-                            ):
-                                # handles subscriptions, overwrites the previous mapping of {item_id : payload_id}
-                                # with {subscription_id : payload_id}
-                                try:
-                                    item_id = request_manager.overwrite_request(
-                                        item_id, response["result"]
-                                    )
-                                    subscription_added = True
-                                except KeyError:
-                                    logger.error(
-                                        f"Error received from subtensor for {item_id}: {response}\n"
-                                        f"Currently received responses: {request_manager.get_results()}"
-                                    )
-                                    raise SubstrateRequestException(str(response))
-                            (
-                                decoded_response,
-                                complete,
-                            ) = await self._process_response(
-                                response,
-                                item_id,
-                                value_scale_type,
-                                storage_item,
-                                result_handler,
-                                runtime=runtime,
-                            )
-                            if (
-                                result_processor is not None
-                                and not inspect.iscoroutinefunction(result_handler)
-                            ):
-                                decoded_response = result_processor(
-                                    decoded_response, item_id
-                                )
-                            request_manager.add_response(
-                                item_id, decoded_response, complete
-                            )
-                            # truncate to 2000 chars for debug logging
-                            if (
-                                len(stringified_response := str(decoded_response))
-                                < 2_000
-                            ):
-                                output_response = stringified_response
-                                # avoids clogging logs up needlessly (esp for Metadata stuff)
-                            else:
-                                output_response = (
-                                    f"{stringified_response[:2_000]} (truncated)"
-                                )
-                            logger.debug(
-                                f"Received response for item ID {item_id}:\n{output_response}\n"
-                                f"Complete: {complete}"
-                            )
-
-                if request_manager.is_complete:
-                    await ws.mark_response_received()
-                    break
-                else:
-                    await asyncio.sleep(0.01)
+                    await ws.discard_request(item_id)
 
         return request_manager.get_results()
 
@@ -3670,17 +3716,23 @@ class AsyncSubstrateInterface(SubstrateMixin):
         # Send all calls as one JSON-RPC batch frame, then gather responses by id.
         async with self.ws as ws:
             await ws.mark_waiting_for_response()
-            item_ids = await ws.send_batch(payloads)
+            item_ids: list[str] = []
             responses: dict[str, dict] = {}
-            pending = set(item_ids)
-            while pending:
-                for item_id in list(pending):
-                    if (response := await ws.retrieve(item_id)) is not None:
-                        responses[item_id] = response
-                        pending.discard(item_id)
-                if pending:
-                    await asyncio.sleep(0.01)
-            await ws.mark_response_received()
+            pending: set[str] = set()
+            try:
+                item_ids = await ws.send_batch(payloads)
+                pending = set(item_ids)
+                while pending:
+                    for item_id in list(pending):
+                        if (response := await ws.retrieve(item_id)) is not None:
+                            responses[item_id] = response
+                            pending.discard(item_id)
+                    if pending:
+                        await asyncio.sleep(0.01)
+            finally:
+                await ws.mark_response_received()
+                for item_id in pending:
+                    await ws.discard_request(item_id)
 
         # Decode each result against its own output type, preserving input order.
         results: list[ScaleValue] = []
