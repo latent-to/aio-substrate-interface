@@ -1,9 +1,4 @@
-> [!IMPORTANT]
-> **This repository is archived and no longer maintained.**
->
-> Bittensor 11, developed in the [subtensor monorepo](https://github.com/RaoFoundation/subtensor), ships its own substrate transport layer and no longer depends on this package. Existing releases remain installable from PyPI.
-
-# Async Substrate Interface
+# AIO Substrate Interface
 
 This project provides an asynchronous interface for interacting with [Substrate](https://substrate.io/)-based
 blockchains. Its API is based on the [py-substrate-interface](https://github.com/polkascan/py-substrate-interface)

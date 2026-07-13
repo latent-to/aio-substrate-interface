@@ -1,5 +1,5 @@
 [project]
-name = "async-substrate-interface"
+name = "aio-substrate-interface"
 version = "2.2.1"
 description = "Asyncio library for interacting with substrate. Mostly API-compatible with py-substrate-interface"
 readme = "README.md"
@@ -17,7 +17,6 @@ dependencies = [
 requires-python = ">=3.10,<3.15"
 
 authors = [
-    { name = "Opentensor Foundation" },
     { name = "BD Himes", email = "b@latent.to" }
 ]
 
