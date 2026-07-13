@@ -4,6 +4,9 @@ This project provides an asynchronous interface for interacting with [Substrate]
 blockchains. Its API is based on the [py-substrate-interface](https://github.com/polkascan/py-substrate-interface)
 project, but is not fully compatible.
 
+This is the successor to [async-substrate-interface](https://github.com/RaoFoundation/async-substrate-interface/),
+which was archived
+
 Additionally, this project uses [cyscale](https://github.com/latent-to/cyscale) instead
 of [py-scale-codec](https://github.com/polkascan/py-scale-codec) for
 faster [SCALE](https://docs.substrate.io/reference/scale-codec/) decoding. Since v2.0, because cyscale and
@@ -21,7 +24,7 @@ pip install cyscale
 To install the package, use the following command:
 
 ```bash
-pip install async-substrate-interface
+pip install aio-substrate-interface
 ```
 
 ## Usage
@@ -179,5 +182,5 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Contact
 
-For any questions or inquiries, please join the Bittensor Development Discord
-server: [Church of Rao](https://discord.gg/XC7ucQmq2Q).
+For any questions or inquiries, please open an issue in this repo.
+
