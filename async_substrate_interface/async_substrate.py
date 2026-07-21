@@ -65,9 +65,7 @@ from async_substrate_interface.utils import (
     rng as random,
 )
 from async_substrate_interface.utils.cache import (
-    async_sql_lru_cache,
     cached_fetcher,
-    AsyncSqliteDB,
 )
 from async_substrate_interface.utils.decoding import (
     _determine_if_old_runtime_call,
@@ -4694,82 +4692,6 @@ class AsyncSubstrateInterface(SubstrateMixin):
             return asyncio.create_task(co)
         else:
             return await co
-
-
-class DiskCachedAsyncSubstrateInterface(AsyncSubstrateInterface):
-    """
-    Uses disk-caching in addition to memory-caching for the cached methods
-
-    Loads the cache from the disk at startup, where it is kept in-memory, and dumps to the disk
-    when the connection is closed.
-
-    For `wss://` endpoints, a persistent `_SessionResumingSSLContext` is created so
-    that TLS sessions are reused across reconnections.  The effective session TTL is the minimum
-    of `ssl_session_ttl` (default `SSL_SESSION_TTL`) and the server-advertised timeout.
-    """
-
-    def __init__(
-        self,
-        url: str,
-        *args,
-        ssl_session_ttl: int = SSL_SESSION_TTL,
-        **kwargs,
-    ):
-        ssl_context: Optional[_SessionResumingSSLContext] = None
-        if url.startswith("wss://") and not kwargs.get("_mock", False):
-            ssl_context = _SessionResumingSSLContext(session_ttl=ssl_session_ttl)
-            ssl_context.set_default_verify_paths()
-        kwargs.pop("_ssl_context", None)
-        super().__init__(url, *args, _ssl_context=ssl_context, **kwargs)  # type: ignore[misc]
-
-    async def initialize(self) -> None:
-        db = AsyncSqliteDB(self.url)
-        cached = await db.load_dns_cache(self.url)
-        if cached is not None:
-            addrinfos, saved_at_unix = cached
-            age = time.time() - saved_at_unix
-            # Reconstruct a monotonic timestamp so _resolve_host's TTL check works correctly
-            self.ws._dns_cache = (addrinfos, time.monotonic() - age)
-            logger.debug(f"Loaded DNS cache from disk (age={age:.0f}s)")
-        await self.runtime_cache.load_from_disk(self.url)
-        await self._initialize()
-
-    async def close(self):
-        """
-        Closes the substrate connection and the websocket connection, dumps the runtime and DNS
-        caches to disk.
-        """
-        db = AsyncSqliteDB(self.url)
-        dns_cache = getattr(self.ws, "_dns_cache", None)
-        if dns_cache is not None:
-            addrinfos, _ = dns_cache
-            await db.save_dns_cache(self.url, addrinfos)
-        try:
-            await self.runtime_cache.dump_to_disk(self.url)
-            await self.ws.shutdown()
-        except AttributeError:
-            pass
-        await db.close()
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def get_parent_block_hash(self, block_hash):
-        return await self._get_parent_block_hash(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_RUNTIME_CACHE_SIZE)
-    async def get_block_runtime_info(self, block_hash: str) -> dict:
-        return await self._get_block_runtime_info(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def get_block_runtime_version_for(self, block_hash: str):
-        return await self._get_block_runtime_version_for(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def _cached_get_block_hash(self, block_id: int) -> str:
-        return await self._get_block_hash(block_id)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def _cached_get_block_number(self, block_hash: str) -> int:
-        return await self._get_block_number(block_hash=block_hash)
 
 
 async def get_async_substrate_interface(
