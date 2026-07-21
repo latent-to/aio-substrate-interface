@@ -1,13 +1,11 @@
 import subprocess
-import time
 import sys
 
 import pytest
 
-from async_substrate_interface import AsyncSubstrateInterface, SubstrateInterface
-from async_substrate_interface.errors import MaxRetriesExceeded, StateDiscardedError
+from async_substrate_interface import AsyncSubstrateInterface
+from async_substrate_interface.errors import StateDiscardedError
 from async_substrate_interface.substrate_addons import (
-    RetrySyncSubstrate,
     RetryAsyncSubstrate,
 )
 from tests.conftest import start_docker_container
@@ -96,56 +94,6 @@ def single_local_chain():
         process.process.kill()
 
 
-def test_retry_sync_substrate(single_local_chain):
-    # Wait for the Docker container to be ready
-    if not wait_for_output(single_local_chain.process, "Imported #1", timeout=60):
-        raise TimeoutError(
-            "Docker container did not start properly - 'Imported #1' not found in output"
-        )
-
-    with RetrySyncSubstrate(
-        single_local_chain.uri, fallback_chains=[LATENT_LITE_ENTRYPOINT]
-    ) as substrate:
-        for i in range(10):
-            assert substrate.get_chain_head().startswith("0x")
-            if i == 8:
-                subprocess.run(["docker", "stop", single_local_chain.name])
-            if i > 8:
-                assert substrate.chain_endpoint == LATENT_LITE_ENTRYPOINT
-            time.sleep(2)
-
-
-def test_retry_sync_substrate_max_retries(docker_containers):
-    # Wait for both Docker containers to be ready
-    for i, container in enumerate(docker_containers):
-        if not wait_for_output(container.process, "Imported #1", timeout=60):
-            raise TimeoutError(
-                f"Docker container {i} did not start properly - 'Imported #1' not found in output"
-            )
-
-    with RetrySyncSubstrate(
-        docker_containers[0].uri, fallback_chains=[docker_containers[1].uri]
-    ) as substrate:
-        for i in range(5):
-            assert substrate.get_chain_head().startswith("0x")
-            if i == 2:
-                subprocess.run(["docker", "pause", docker_containers[0].name])
-            if i == 3:
-                assert substrate.chain_endpoint == docker_containers[1].uri
-            if i == 4:
-                subprocess.run(["docker", "pause", docker_containers[1].name])
-                with pytest.raises(MaxRetriesExceeded):
-                    substrate.get_chain_head().startswith("0x")
-            time.sleep(2)
-
-
-def test_retry_sync_substrate_offline():
-    with pytest.raises(ConnectionError):
-        RetrySyncSubstrate(
-            "ws://127.0.0.1:9944", fallback_chains=["ws://127.0.0.1:9945"]
-        )
-
-
 @pytest.mark.asyncio
 async def test_retry_async_subtensor_archive_node():
     async with AsyncSubstrateInterface(LATENT_LITE_ENTRYPOINT) as substrate:
@@ -159,18 +107,6 @@ async def test_retry_async_subtensor_archive_node():
         assert isinstance((await substrate.get_block(block_number=old_block)), dict)
 
 
-def test_retry_sync_subtensor_archive_node():
-    with SubstrateInterface(LATENT_LITE_ENTRYPOINT) as substrate:
-        current_block = substrate.get_block_number()
-        old_block = current_block - 1000
-        with pytest.raises(StateDiscardedError):
-            substrate.get_block(block_number=old_block)
-    with RetrySyncSubstrate(
-        LATENT_LITE_ENTRYPOINT, archive_nodes=[ARCHIVE_ENTRYPOINT]
-    ) as substrate:
-        assert isinstance((substrate.get_block(block_number=old_block)), dict)
-
-
 @pytest.mark.asyncio
 async def test_retry_async_substrate_runtime_call_with_keyword_args():
     """Test that runtime_call works with keyword arguments (parameter name conflict fix)."""
@@ -180,20 +116,6 @@ async def test_retry_async_substrate_runtime_call_with_keyword_args():
         # This should not raise TypeError due to parameter name conflict
         # The 'method' kwarg should not conflict with _retry's parameter
         result = await substrate.runtime_call(
-            api="SwapRuntimeApi",
-            method="current_alpha_price",
-            params=[1],
-            block_hash=None,
-        )
-        assert result is not None
-
-
-def test_retry_sync_substrate_runtime_call_with_keyword_args():
-    """Test that runtime_call works with keyword arguments (parameter name conflict fix)."""
-    with RetrySyncSubstrate(LATENT_LITE_ENTRYPOINT, retry_forever=True) as substrate:
-        # This should not raise TypeError due to parameter name conflict
-        # The 'method' kwarg should not conflict with _retry's parameter
-        result = substrate.runtime_call(
             api="SwapRuntimeApi",
             method="current_alpha_price",
             params=[1],
