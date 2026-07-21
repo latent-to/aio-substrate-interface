@@ -42,6 +42,11 @@ Notes:
 import os
 from typing import Any, Callable
 
+from async_substrate_interface.async_substrate import (
+    AsyncSubstrateInterface,
+    raw_websocket_logger,
+)
+
 # Not really necessary, but doesn't hurt to have
 os.environ["SUBSTRATE_CACHE_METHOD_SIZE"] = "0"
 os.environ["SUBSTRATE_RUNTIME_CACHE_SIZE"] = "0"
@@ -50,11 +55,6 @@ import logging
 import json
 import subprocess
 import pathlib
-
-from async_substrate_interface.sync_substrate import (
-    raw_websocket_logger,
-    SubstrateInterface,
-)
 
 from tests.helpers.settings import ARCHIVE_ENTRYPOINT
 
@@ -66,7 +66,7 @@ OUTPUT_METADATA_V15 = "/tmp/integration_websocket_at_version.txt"
 INTEGRATION_WS_DATA = pathlib.Path(__file__).parent / "integration_websocket_data.py"
 
 
-def main(seed: str, method: Callable[[SubstrateInterface], Any]):
+def main(seed: str, method: Callable[[AsyncSubstrateInterface], Any]):
     """
     Runs the given method on Subtensor, processes the websocket data that occurred during that method's execution,
     attaches it with the "seed" arg as a key to a new tmp file ("/tmp/bittensor-ws-output.txt")
@@ -88,7 +88,7 @@ def main(seed: str, method: Callable[[SubstrateInterface], Any]):
     handler.setLevel(logging.DEBUG)
     raw_websocket_logger.addHandler(handler)
 
-    substrate = SubstrateInterface(
+    substrate = AsyncSubstrateInterface(
         ARCHIVE_ENTRYPOINT,
         chain_name="Bittensor",
         ss58_format=42,
@@ -222,7 +222,7 @@ def main(seed: str, method: Callable[[SubstrateInterface], Any]):
 
 if __name__ == "__main__":
     # Example usage
-    def fn_(substrate: SubstrateInterface) -> Any:
+    def fn_(substrate: AsyncSubstrateInterface) -> Any:
         block = 7959635
         block_hash = substrate.get_block_hash(block)
         print(block_hash)
