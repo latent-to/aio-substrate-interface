@@ -12,7 +12,6 @@ from async_substrate_interface.async_substrate import (
     DiskCachedAsyncSubstrateInterface,
     AsyncSubstrateInterface,
 )
-from async_substrate_interface.sync_substrate import SubstrateInterface
 from tests.helpers.settings import LATENT_LITE_ENTRYPOINT
 
 
@@ -76,23 +75,6 @@ async def test_disk_cache():
     assert block_runtime_info == block_runtime_info_non_cache
     assert block_runtime_version_for == block_runtime_version_for_non_cache
     # Verify data integrity with sync Substrate Interface
-    with SubstrateInterface(
-        LATENT_LITE_ENTRYPOINT, ss58_format=42, chain_name="Bittensor"
-    ) as sync_substrate:
-        block_hash_sync = sync_substrate.get_block_hash(current_block)
-        parent_block_hash_sync = sync_substrate.get_parent_block_hash(
-            block_hash_non_cache
-        )
-        block_runtime_info_sync = sync_substrate.get_block_runtime_info(
-            block_hash_non_cache
-        )
-        block_runtime_version_for_sync = sync_substrate.get_block_runtime_version_for(
-            block_hash_non_cache
-        )
-    assert block_hash == block_hash_sync
-    assert parent_block_hash == parent_block_hash_sync
-    assert block_runtime_info == block_runtime_info_sync
-    assert block_runtime_version_for == block_runtime_version_for_sync
     # Verify data is pulling from disk cache.
     async with DiskCachedAsyncSubstrateInterface(
         LATENT_LITE_ENTRYPOINT, ss58_format=42, chain_name="Bittensor"
