@@ -581,6 +581,17 @@ class _SessionResumingSSLContext(ssl.SSLContext):
         )
 
 
+# Errors that mean the connection dropped and the handler should reconnect, as opposed
+# to a fatal application error. SSL errors (e.g. unexpected EOF on a flaky TLS link) are
+# treated the same as an abnormal close.
+RECONNECT_EXCEPTIONS = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionClosed,
+    ssl.SSLError,
+)
+
+
 class Websocket:
     def __init__(
         self,
@@ -943,9 +954,7 @@ class Websocket:
                 return None  # Clean exit
 
             # Check for timeout/connection errors that should trigger reconnect
-            if isinstance(
-                task_res, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if isinstance(task_res, RECONNECT_EXCEPTIONS):
                 should_reconnect = True
                 logger.debug(f"Reconnection triggered by: {type(task_res).__name__}")
 
@@ -1138,11 +1147,7 @@ class Websocket:
             logger.debug("ConnectionClosedOK")
             return e
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception("Websocket receiving exception", exc_info=e)
                 for fut in self._received.values():
                     if not fut.done():
@@ -1176,11 +1181,7 @@ class Websocket:
                 logger.debug("Sent to websocket")
                 await self._reset_activity_timer()
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception(
                     f"Websocket sending exception; "
                     f"sending: {self._sending.qsize()}; "
