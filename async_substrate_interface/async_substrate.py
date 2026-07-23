@@ -581,6 +581,17 @@ class _SessionResumingSSLContext(ssl.SSLContext):
         )
 
 
+# Errors that mean the connection dropped and the handler should reconnect, as opposed
+# to a fatal application error. SSL errors (e.g. unexpected EOF on a flaky TLS link) are
+# treated the same as an abnormal close.
+RECONNECT_EXCEPTIONS = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionClosed,
+    ssl.SSLError,
+)
+
+
 class Websocket:
     def __init__(
         self,
@@ -646,6 +657,7 @@ class Websocket:
             str, Callable[[], Awaitable[Optional[str]]]
         ] = {}
         self._recovering_subscriptions: set[str] = set()
+        self._orphaned_subscriptions: set[str] = set()
         self._recovery_tasks: set[asyncio.Task] = set()
         # maps between the subscription ids consumers hold and the ids the server currently
         # knows them by (these diverge when a recovery re-establishes a subscription)
@@ -687,7 +699,14 @@ class Websocket:
                 # Consume the dead task's outcome so it is not later reported as an unretrieved exception.
                 task.exception()
             self._attempts = 0
+            # Same policy as the handler's reconnect path: subscriptions the dead handler left behind
+            # are re-established when they have a recoverer, and failed explicitly when they do not.
+            self._orphan_unrecoverable_subscriptions()
             await self._connect_internal(force=True)
+        if self._subscription_recoverers:
+            recovery_task = asyncio.create_task(self._recover_subscriptions())
+            self._recovery_tasks.add(recovery_task)
+            recovery_task.add_done_callback(self._recovery_tasks.discard)
 
     async def mark_waiting_for_response(self):
         """
@@ -724,37 +743,43 @@ class Websocket:
         Wait for a coroutine with a shared activity timeout.
         Returns the result or raises TimeoutError if no activity for timeout seconds.
         """
-        activity_task = asyncio.create_task(self._last_activity.wait())
-
         if isinstance(coro, asyncio.Task):
             main_task = coro
         else:
             main_task = asyncio.create_task(coro)
+        activity_task = asyncio.create_task(self._last_activity.wait())
 
         try:
-            done, pending = await asyncio.wait(
-                [main_task, activity_task],
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Looped rather than recursive: every activity event during a single wait would
+            # otherwise add a stack frame, growing without bound under send-heavy bursts.
+            while True:
+                done, pending = await asyncio.wait(
+                    [main_task, activity_task],
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            if not done:
-                logger.debug(f"Activity timeout after {timeout}s, no activity detected")
-                for task in pending:
-                    task.cancel()
-                raise TimeoutError()
+                if not done:
+                    logger.debug(
+                        f"Activity timeout after {timeout}s, no activity detected"
+                    )
+                    for task in pending:
+                        task.cancel()
+                    raise TimeoutError()
 
-            if main_task in done:
-                activity_task.cancel()
+                if main_task in done:
+                    activity_task.cancel()
 
-                exc = main_task.exception()
-                if exc is not None:
-                    raise exc
-                else:
-                    return main_task.result()
-            else:
+                    exc = main_task.exception()
+                    if exc is not None:
+                        raise exc
+                    else:
+                        return main_task.result()
+
+                # activity fired: restart the timeout window, waiting on the fresh event
+                # installed by _reset_activity_timer
                 logger.debug("Activity detected, resetting timeout")
-                return await self._wait_with_activity_timeout(main_task, timeout)
+                activity_task = asyncio.create_task(self._last_activity.wait())
 
         except asyncio.CancelledError:
             main_task.cancel()
@@ -817,16 +842,26 @@ class Websocket:
         return infos[0]
 
     async def connect(self, force=False):
-        if not force:
-            async with self._lock:
-                return await self._connect_internal(force)
-        else:
-            logger.debug("Proceeding without acquiring lock.")
+        # Always serialized on the lock: a forced (handler-driven) reconnect racing an
+        # unforced connect from `__aenter__` would otherwise create two sockets, orphaning
+        # one. Callers that already hold the lock use `_connect_internal` directly.
+        async with self._lock:
             return await self._connect_internal(force)
 
     async def _connect_internal(self, force):
         # Check state again after acquiring lock to avoid duplicate connections
         if not force and self.state in (State.OPEN, State.CONNECTING):
+            return None
+        if (
+            not force
+            and self._send_recv_task is not None
+            and not self._send_recv_task.done()
+        ):
+            # A live handler owns the connection lifecycle: it is mid-reconnect, or about to
+            # notice the drop itself. Proceeding here would `_cancel` it, aborting the
+            # reconnection and its resubmitted requests/subscription recovery. Queued sends
+            # will be flushed once the handler finishes reconnecting.
+            logger.debug("Handler alive; leaving reconnection to it.")
             return None
 
         logger.debug(f"Websocket connecting to {self.ws_url}")
@@ -851,25 +886,38 @@ class Websocket:
                     pass
             logger.debug("Attempting connection")
             loop = asyncio.get_running_loop()
-            try:
-                family, type_, proto, _, sockaddr = await self._resolve_host()
-                tcp_sock = socket.socket(family, type_, proto)
-                tcp_sock.setblocking(False)
+            # Retried in a loop rather than by re-calling `connect`: re-entering `connect`
+            # from here would deadlock on the (non-reentrant) lock already held by the
+            # non-forced path.
+            dns_attempts = 0
+            while True:
                 try:
-                    await asyncio.wait_for(
-                        loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                    family, type_, proto, _, sockaddr = await self._resolve_host()
+                    tcp_sock = socket.socket(family, type_, proto)
+                    tcp_sock.setblocking(False)
+                    try:
+                        await asyncio.wait_for(
+                            loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                        )
+                    except Exception:
+                        tcp_sock.close()
+                        self._dns_cache = None  # invalidate on TCP failure
+                        raise
+                    connection = await asyncio.wait_for(
+                        connect(self.ws_url, sock=tcp_sock, **self._options),
+                        timeout=10.0,
                     )
-                except Exception:
-                    tcp_sock.close()
-                    self._dns_cache = None  # invalidate on TCP failure
-                    raise
-                connection = await asyncio.wait_for(
-                    connect(self.ws_url, sock=tcp_sock, **self._options), timeout=10.0
-                )
-            except socket.gaierror:
-                logger.debug("Hostname not known (this is just for testing")
-                await asyncio.sleep(10)
-                return await self.connect(force=force)
+                    break
+                except socket.gaierror:
+                    self._dns_cache = None
+                    dns_attempts += 1
+                    if dns_attempts >= self._max_retries:
+                        raise
+                    logger.warning(
+                        f"DNS resolution failed for {self.ws_url}. "
+                        f"Retrying ({dns_attempts}/{self._max_retries})."
+                    )
+                    await asyncio.sleep(10)
             logger.debug("Connection established")
             self.ws = connection
             if self._ssl_context is not None:
@@ -889,79 +937,94 @@ class Websocket:
         return None
 
     async def _handler(self, ws: ClientConnection) -> Optional[Exception]:
-        logger.debug("WS handler attached")
-        recv_task = asyncio.create_task(self._start_receiving(ws))
-        send_task = asyncio.create_task(self._start_sending(ws))
-        try:
-            done, pending = await asyncio.wait(
-                [recv_task, send_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            # Handler was cancelled, clean up child tasks
-            for task in [recv_task, send_task]:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            raise
-        loop = asyncio.get_running_loop()
-        should_reconnect = False
-        is_retry = False
-
-        for task in pending:
-            task.cancel()
+        # Iterative across reconnects rather than recursive: recursing here would grow the
+        # coroutine stack by one frame per reconnect, eventually hitting RecursionError on
+        # a long-lived flaky connection.
+        while True:
+            logger.debug("WS handler attached")
+            recv_task = asyncio.create_task(self._start_receiving(ws))
+            send_task = asyncio.create_task(self._start_sending(ws))
             try:
-                await task
+                done, pending = await asyncio.wait(
+                    [recv_task, send_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             except asyncio.CancelledError:
-                pass
+                # Handler was cancelled, clean up child tasks
+                for task in [recv_task, send_task]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                raise
+            loop = asyncio.get_running_loop()
+            should_reconnect = False
+            reconnect_trigger = ""
 
-        for task in done:
-            task_res = task.result()
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-            # If ConnectionClosedOK, graceful shutdown - don't reconnect
-            if (
-                isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
-                and self._waiting_for_response <= 0
-            ):
-                logger.debug("Graceful shutdown detected, not reconnecting")
-                return None  # Clean exit
+            for task in done:
+                # The pump tasks return their errors, but a raise (a bug in their own except
+                # blocks) must flow through the same triage rather than crash the handler.
+                task_res = task.exception() or task.result()
 
-            # Check for timeout/connection errors that should trigger reconnect
-            if isinstance(
-                task_res, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
-                should_reconnect = True
-                logger.debug(f"Reconnection triggered by: {type(task_res).__name__}")
+                # If ConnectionClosedOK, graceful shutdown - don't reconnect
+                if (
+                    isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
+                    and self._waiting_for_response <= 0
+                ):
+                    logger.debug("Graceful shutdown detected, not reconnecting")
+                    return None  # Clean exit
 
-            if isinstance(task_res, (asyncio.TimeoutError, TimeoutError)):
-                self._attempts += 1
-                is_retry = True
+                # Check for timeout/connection errors that should trigger reconnect
+                if isinstance(task_res, RECONNECT_EXCEPTIONS):
+                    should_reconnect = True
+                    reconnect_trigger = type(task_res).__name__
+                    logger.debug(f"Reconnection triggered by: {reconnect_trigger}")
 
-        if should_reconnect is True:
+            if not should_reconnect:
+                # The task from `pending` was cancelled above: `.result()` on it would raise
+                # CancelledError, making the handler task itself read as cancelled — and
+                # `retrieve` deliberately ignores cancelled handlers, so consumers would then
+                # poll forever instead of receiving the real error.
+                for task in (recv_task, send_task):
+                    if task.cancelled():
+                        continue
+                    if isinstance(e := task.exception() or task.result(), Exception):
+                        return e
+                if len(self._received_subscriptions) > 0:
+                    return SubstrateRequestException(
+                        "Currently open subscriptions while disconnecting. "
+                        "Ensure these are unsubscribed from before closing in the future."
+                    )
+                return None
+
             # Subscriptions cannot be resumed server-side after a reconnect. Those registered with a
-            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others make
-            # reconnection impossible.
-            if unrecoverable_subscriptions := [
-                sub_id
-                for sub_id in self._received_subscriptions
-                if sub_id not in self._subscription_recoverers
-                and sub_id not in self._recovering_subscriptions
-            ]:
-                return SubstrateRequestException(
-                    "Unable to reconnect because there are currently open subscriptions "
-                    f"with no recovery handler: {unrecoverable_subscriptions}"
-                )
+            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others are
+            # failed explicitly so their consumers get an error on their next poll instead of a
+            # silent hang, and so the reconnect can proceed for everyone else.
+            self._orphan_unrecoverable_subscriptions()
 
-            if is_retry:
-                if self._attempts >= self._max_retries:
-                    logger.error("Max retries exceeded.")
-                    return TimeoutError("Max retries exceeded.")
-                logger.info(
-                    f"Timeout occurred. Reconnecting. Attempt {self._attempts} of {self._max_retries}"
-                )
+            # Every reconnect trigger — timeout or abnormal close — consumes retry budget;
+            # `_start_receiving` resets the counter as soon as traffic flows again, so the cap
+            # is only reached by consecutive failures with no successful traffic in between.
+            # Without this, a server that accepts connections and immediately closes them
+            # would be hammered in an unbounded tight loop.
+            self._attempts += 1
+            if self._attempts >= self._max_retries:
+                logger.error("Max retries exceeded.")
+                return TimeoutError("Max retries exceeded.")
+            logger.info(
+                f"Connection lost ({reconnect_trigger}). Reconnecting. "
+                f"Attempt {self._attempts} of {self._max_retries}"
+            )
 
             async with self._lock:
                 resent_batches: set[str] = set()
@@ -985,28 +1048,47 @@ class Websocket:
                         logger.debug(f"Resubmitting {parsed['id']}")
                         await self._sending.put(parsed)
 
+            if self._attempts > 1:
+                # repeated failures without any successful traffic in between: back off
+                backoff = min(2 ** (self._attempts - 1), 30)
+                logger.debug(f"Backing off {backoff}s before reconnecting")
+                await asyncio.sleep(backoff)
             logger.debug("Attempting reconnection...")
-            await self.connect(True)
+            while True:
+                try:
+                    await self.connect(True)
+                    break
+                except (
+                    OSError,
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    websockets.exceptions.InvalidHandshake,
+                ) as connect_error:
+                    # The endpoint may be briefly unreachable at exactly the moment we try to
+                    # reconnect; that must consume retry budget, not kill the handler (which
+                    # would strand every resubmitted in-flight request).
+                    self._attempts += 1
+                    if self._attempts >= self._max_retries:
+                        logger.error(
+                            f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                            f"Max retries exceeded."
+                        )
+                        return connect_error
+                    delay = min(2**self._attempts, 30)
+                    logger.warning(
+                        f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                        f"Retrying in {delay}s. Attempt {self._attempts} of {self._max_retries}."
+                    )
+                    await asyncio.sleep(delay)
             logger.debug(f"Reconnected. Send queue size: {self._sending.qsize()}")
             if self._subscription_recoverers:
-                # Run recovery concurrently with the recursed handler below: the recoverers make RPC
-                # requests over this websocket, which need the send/recv tasks to be running.
+                # Run recovery concurrently with the next handler iteration: the recoverers make
+                # RPC requests over this websocket, which need the send/recv tasks to be running.
                 recovery_task = asyncio.create_task(self._recover_subscriptions())
                 self._recovery_tasks.add(recovery_task)
                 recovery_task.add_done_callback(self._recovery_tasks.discard)
-            # Recursively call handler
             assert self.ws is not None
-            return await self._handler(self.ws)
-        elif isinstance(e := recv_task.result(), Exception):
-            return e
-        elif isinstance(e := send_task.result(), Exception):
-            return e
-        elif len(self._received_subscriptions) > 0:
-            return SubstrateRequestException(
-                "Currently open subscriptions while disconnecting. "
-                "Ensure these are unsubscribed from before closing in the future."
-            )
-        return None
+            ws = self.ws
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.shutdown_timer is not None:
@@ -1024,7 +1106,10 @@ class Websocket:
                         pass
                 if self.ws is not None:
                     self._exit_task = asyncio.create_task(self._exit_with_timer())
-        self._attempts = 0
+        # NOTE: `_attempts` is deliberately not reset here. It is reset by `_start_receiving`
+        # on successful traffic and by `_restart_handler_if_dead` when reviving a dead handler;
+        # resetting it on every context exit would let concurrent requests wipe the shared retry
+        # counter mid-reconnect, making `max_retries` unreachable under load.
 
     async def _exit_with_timer(self):
         """
@@ -1125,11 +1210,7 @@ class Websocket:
             logger.debug("ConnectionClosedOK")
             return e
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception("Websocket receiving exception", exc_info=e)
                 for fut in self._received.values():
                     if not fut.done():
@@ -1163,11 +1244,7 @@ class Websocket:
                 logger.debug("Sent to websocket")
                 await self._reset_activity_timer()
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception(
                     f"Websocket sending exception; "
                     f"sending: {self._sending.qsize()}; "
@@ -1267,6 +1344,7 @@ class Websocket:
             logger.debug(f"Unwatched extrinsic subscription {subscription_id}")
             self._received_subscriptions.pop(subscription_id, None)
             self._subscription_recoverers.pop(subscription_id, None)
+            self._orphaned_subscriptions.discard(subscription_id)
             # a recovered subscription is known to the server by its aliased id
             server_subscription_id = self._sub_original_to_alias.pop(
                 subscription_id, subscription_id
@@ -1291,8 +1369,8 @@ class Websocket:
         the subscription is open.
 
         Server-side subscription state does not survive a reconnection, so without a recoverer an open
-        subscription prevents reconnecting entirely. With one, the reconnect proceeds and the recoverer is
-        awaited afterward. The recoverer must either:
+        subscription is failed on reconnect: its consumer's next `retrieve` raises. With a recoverer, the
+        subscription is re-established after reconnecting. The recoverer must either:
 
         - return a new server-side subscription id (from re-establishing the subscription), which is then
           aliased to `subscription_id` so the consumer polling the original id keeps receiving messages
@@ -1333,6 +1411,32 @@ class Websocket:
             )
             return
         await queue.put(message)
+
+    def _orphan_unrecoverable_subscriptions(self) -> list[str]:
+        """
+        Fails every open subscription that has no recoverer (and is not mid-recovery from an earlier
+        reconnection): server-side subscription state does not survive a reconnect, so these can never
+        produce another message. Each is dropped from the open set — so it cannot hold the connection
+        open or linger across reconnects — and marked orphaned, making its consumer's next `retrieve`
+        raise instead of polling an abandoned queue forever.
+
+        Returns the orphaned subscription ids.
+        """
+        orphaned = [
+            sub_id
+            for sub_id in self._received_subscriptions
+            if sub_id not in self._subscription_recoverers
+            and sub_id not in self._recovering_subscriptions
+        ]
+        for sub_id in orphaned:
+            del self._received_subscriptions[sub_id]
+            self._orphaned_subscriptions.add(sub_id)
+        if orphaned:
+            logger.error(
+                f"Open subscriptions with no recovery handler cannot survive a reconnection "
+                f"and have been dropped: {orphaned}"
+            )
+        return orphaned
 
     async def _recover_subscriptions(self) -> None:
         """
@@ -1414,6 +1518,13 @@ class Websocket:
                 del self._received[item_id]
                 return res
         else:
+            if item_id in self._orphaned_subscriptions:
+                # delivered once; the consumer is expected to stop polling after this
+                self._orphaned_subscriptions.discard(item_id)
+                raise SubstrateRequestException(
+                    f"Subscription {item_id} was severed by a reconnection and cannot be "
+                    f"resumed because it has no recovery handler."
+                )
             try:
                 subscription = self._received_subscriptions[item_id].get_nowait()
                 self._received_subscriptions[item_id].task_done()
@@ -4863,10 +4974,25 @@ class AsyncSubstrateInterface(SubstrateMixin):
             )
 
         else:
-            response = await self.rpc_request("author_submitExtrinsic", [extrinsic_hex])
+            try:
+                response = await self.rpc_request(
+                    "author_submitExtrinsic", [extrinsic_hex]
+                )
+                submitted_hash = response["result"]
+            except SubstrateRequestException as e:
+                if "already imported" not in str(e).lower():
+                    raise
+                # The node already has this extrinsic even though this call errored — most
+                # likely a reconnection re-sent an in-flight submission. The submission itself
+                # succeeded, and the hash is deterministic from the signed bytes.
+                logger.info(
+                    f"Extrinsic {extrinsic_hash} was already imported by the node "
+                    f"(likely resubmitted by a reconnection); treating as submitted."
+                )
+                submitted_hash = extrinsic_hash
 
             result = AsyncExtrinsicReceipt(
-                substrate=self, extrinsic_hash=response["result"]
+                substrate=self, extrinsic_hash=submitted_hash
             )
 
         return result
