@@ -851,25 +851,38 @@ class Websocket:
                     pass
             logger.debug("Attempting connection")
             loop = asyncio.get_running_loop()
-            try:
-                family, type_, proto, _, sockaddr = await self._resolve_host()
-                tcp_sock = socket.socket(family, type_, proto)
-                tcp_sock.setblocking(False)
+            # Retried in a loop rather than by re-calling `connect`: re-entering `connect`
+            # from here would deadlock on the (non-reentrant) lock already held by the
+            # non-forced path.
+            dns_attempts = 0
+            while True:
                 try:
-                    await asyncio.wait_for(
-                        loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                    family, type_, proto, _, sockaddr = await self._resolve_host()
+                    tcp_sock = socket.socket(family, type_, proto)
+                    tcp_sock.setblocking(False)
+                    try:
+                        await asyncio.wait_for(
+                            loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                        )
+                    except Exception:
+                        tcp_sock.close()
+                        self._dns_cache = None  # invalidate on TCP failure
+                        raise
+                    connection = await asyncio.wait_for(
+                        connect(self.ws_url, sock=tcp_sock, **self._options),
+                        timeout=10.0,
                     )
-                except Exception:
-                    tcp_sock.close()
-                    self._dns_cache = None  # invalidate on TCP failure
-                    raise
-                connection = await asyncio.wait_for(
-                    connect(self.ws_url, sock=tcp_sock, **self._options), timeout=10.0
-                )
-            except socket.gaierror:
-                logger.debug("Hostname not known (this is just for testing")
-                await asyncio.sleep(10)
-                return await self.connect(force=force)
+                    break
+                except socket.gaierror:
+                    self._dns_cache = None
+                    dns_attempts += 1
+                    if dns_attempts >= self._max_retries:
+                        raise
+                    logger.warning(
+                        f"DNS resolution failed for {self.ws_url}. "
+                        f"Retrying ({dns_attempts}/{self._max_retries})."
+                    )
+                    await asyncio.sleep(10)
             logger.debug("Connection established")
             self.ws = connection
             if self._ssl_context is not None:
