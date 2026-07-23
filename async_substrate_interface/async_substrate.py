@@ -834,16 +834,26 @@ class Websocket:
         return infos[0]
 
     async def connect(self, force=False):
-        if not force:
-            async with self._lock:
-                return await self._connect_internal(force)
-        else:
-            logger.debug("Proceeding without acquiring lock.")
+        # Always serialized on the lock: a forced (handler-driven) reconnect racing an
+        # unforced connect from `__aenter__` would otherwise create two sockets, orphaning
+        # one. Callers that already hold the lock use `_connect_internal` directly.
+        async with self._lock:
             return await self._connect_internal(force)
 
     async def _connect_internal(self, force):
         # Check state again after acquiring lock to avoid duplicate connections
         if not force and self.state in (State.OPEN, State.CONNECTING):
+            return None
+        if (
+            not force
+            and self._send_recv_task is not None
+            and not self._send_recv_task.done()
+        ):
+            # A live handler owns the connection lifecycle: it is mid-reconnect, or about to
+            # notice the drop itself. Proceeding here would `_cancel` it, aborting the
+            # reconnection and its resubmitted requests/subscription recovery. Queued sends
+            # will be flushed once the handler finishes reconnecting.
+            logger.debug("Handler alive; leaving reconnection to it.")
             return None
 
         logger.debug(f"Websocket connecting to {self.ws_url}")
