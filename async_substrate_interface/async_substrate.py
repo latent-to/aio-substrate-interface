@@ -735,37 +735,43 @@ class Websocket:
         Wait for a coroutine with a shared activity timeout.
         Returns the result or raises TimeoutError if no activity for timeout seconds.
         """
-        activity_task = asyncio.create_task(self._last_activity.wait())
-
         if isinstance(coro, asyncio.Task):
             main_task = coro
         else:
             main_task = asyncio.create_task(coro)
+        activity_task = asyncio.create_task(self._last_activity.wait())
 
         try:
-            done, pending = await asyncio.wait(
-                [main_task, activity_task],
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Looped rather than recursive: every activity event during a single wait would
+            # otherwise add a stack frame, growing without bound under send-heavy bursts.
+            while True:
+                done, pending = await asyncio.wait(
+                    [main_task, activity_task],
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            if not done:
-                logger.debug(f"Activity timeout after {timeout}s, no activity detected")
-                for task in pending:
-                    task.cancel()
-                raise TimeoutError()
+                if not done:
+                    logger.debug(
+                        f"Activity timeout after {timeout}s, no activity detected"
+                    )
+                    for task in pending:
+                        task.cancel()
+                    raise TimeoutError()
 
-            if main_task in done:
-                activity_task.cancel()
+                if main_task in done:
+                    activity_task.cancel()
 
-                exc = main_task.exception()
-                if exc is not None:
-                    raise exc
-                else:
-                    return main_task.result()
-            else:
+                    exc = main_task.exception()
+                    if exc is not None:
+                        raise exc
+                    else:
+                        return main_task.result()
+
+                # activity fired: restart the timeout window, waiting on the fresh event
+                # installed by _reset_activity_timer
                 logger.debug("Activity detected, resetting timeout")
-                return await self._wait_with_activity_timeout(main_task, timeout)
+                activity_task = asyncio.create_task(self._last_activity.wait())
 
         except asyncio.CancelledError:
             main_task.cancel()
@@ -913,56 +919,73 @@ class Websocket:
         return None
 
     async def _handler(self, ws: ClientConnection) -> Optional[Exception]:
-        logger.debug("WS handler attached")
-        recv_task = asyncio.create_task(self._start_receiving(ws))
-        send_task = asyncio.create_task(self._start_sending(ws))
-        try:
-            done, pending = await asyncio.wait(
-                [recv_task, send_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            # Handler was cancelled, clean up child tasks
-            for task in [recv_task, send_task]:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            raise
-        loop = asyncio.get_running_loop()
-        should_reconnect = False
-        is_retry = False
-
-        for task in pending:
-            task.cancel()
+        # Iterative across reconnects rather than recursive: recursing here would grow the
+        # coroutine stack by one frame per reconnect, eventually hitting RecursionError on
+        # a long-lived flaky connection.
+        while True:
+            logger.debug("WS handler attached")
+            recv_task = asyncio.create_task(self._start_receiving(ws))
+            send_task = asyncio.create_task(self._start_sending(ws))
             try:
-                await task
+                done, pending = await asyncio.wait(
+                    [recv_task, send_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             except asyncio.CancelledError:
-                pass
+                # Handler was cancelled, clean up child tasks
+                for task in [recv_task, send_task]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                raise
+            loop = asyncio.get_running_loop()
+            should_reconnect = False
+            is_retry = False
 
-        for task in done:
-            task_res = task.result()
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-            # If ConnectionClosedOK, graceful shutdown - don't reconnect
-            if (
-                isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
-                and self._waiting_for_response <= 0
-            ):
-                logger.debug("Graceful shutdown detected, not reconnecting")
-                return None  # Clean exit
+            for task in done:
+                task_res = task.result()
 
-            # Check for timeout/connection errors that should trigger reconnect
-            if isinstance(task_res, RECONNECT_EXCEPTIONS):
-                should_reconnect = True
-                logger.debug(f"Reconnection triggered by: {type(task_res).__name__}")
+                # If ConnectionClosedOK, graceful shutdown - don't reconnect
+                if (
+                    isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
+                    and self._waiting_for_response <= 0
+                ):
+                    logger.debug("Graceful shutdown detected, not reconnecting")
+                    return None  # Clean exit
 
-            if isinstance(task_res, (asyncio.TimeoutError, TimeoutError)):
-                self._attempts += 1
-                is_retry = True
+                # Check for timeout/connection errors that should trigger reconnect
+                if isinstance(task_res, RECONNECT_EXCEPTIONS):
+                    should_reconnect = True
+                    logger.debug(
+                        f"Reconnection triggered by: {type(task_res).__name__}"
+                    )
 
-        if should_reconnect is True:
+                if isinstance(task_res, (asyncio.TimeoutError, TimeoutError)):
+                    self._attempts += 1
+                    is_retry = True
+
+            if not should_reconnect:
+                if isinstance(e := recv_task.result(), Exception):
+                    return e
+                elif isinstance(e := send_task.result(), Exception):
+                    return e
+                elif len(self._received_subscriptions) > 0:
+                    return SubstrateRequestException(
+                        "Currently open subscriptions while disconnecting. "
+                        "Ensure these are unsubscribed from before closing in the future."
+                    )
+                return None
+
             # Subscriptions cannot be resumed server-side after a reconnect. Those registered with a
             # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others make
             # reconnection impossible.
@@ -1036,24 +1059,13 @@ class Websocket:
                     await asyncio.sleep(delay)
             logger.debug(f"Reconnected. Send queue size: {self._sending.qsize()}")
             if self._subscription_recoverers:
-                # Run recovery concurrently with the recursed handler below: the recoverers make RPC
-                # requests over this websocket, which need the send/recv tasks to be running.
+                # Run recovery concurrently with the next handler iteration: the recoverers make
+                # RPC requests over this websocket, which need the send/recv tasks to be running.
                 recovery_task = asyncio.create_task(self._recover_subscriptions())
                 self._recovery_tasks.add(recovery_task)
                 recovery_task.add_done_callback(self._recovery_tasks.discard)
-            # Recursively call handler
             assert self.ws is not None
-            return await self._handler(self.ws)
-        elif isinstance(e := recv_task.result(), Exception):
-            return e
-        elif isinstance(e := send_task.result(), Exception):
-            return e
-        elif len(self._received_subscriptions) > 0:
-            return SubstrateRequestException(
-                "Currently open subscriptions while disconnecting. "
-                "Ensure these are unsubscribed from before closing in the future."
-            )
-        return None
+            ws = self.ws
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.shutdown_timer is not None:
