@@ -22,6 +22,7 @@ from hashlib import blake2b
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from scalecodec.types import GenericExtrinsic
 from websockets.asyncio.server import serve
 from websockets.protocol import State
 
@@ -558,3 +559,46 @@ async def test_polling_watch_times_out(monkeypatch):
         await substrate._wait_for_extrinsic_inclusion_via_polling(
             _EXT_HASH, True, timeout=0.05
         )
+
+
+def _fake_extrinsic() -> MagicMock:
+    extrinsic = MagicMock(spec=GenericExtrinsic)
+    extrinsic.data = _EXT_HEX
+    extrinsic.extrinsic_hash = bytes.fromhex(_EXT_HASH[2:])
+    return extrinsic
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_submit_treats_already_imported_as_success():
+    """
+    A reconnection can re-send an in-flight `author_submitExtrinsic`; the node then answers the resent
+    copy with "Transaction Already Imported" even though the submission succeeded. The fire-and-forget
+    branch of `submit_extrinsic` must map that to a normal receipt (the hash is deterministic from the
+    signed bytes), matching what the watch branch already does.
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+
+    async def rpc_request(method, params, **kwargs):
+        assert method == "author_submitExtrinsic"
+        raise SubstrateRequestException(
+            "Submitted transaction is already in the pool: Transaction Already Imported"
+        )
+
+    substrate.rpc_request = rpc_request
+    receipt = await substrate.submit_extrinsic(_fake_extrinsic())
+    assert receipt.extrinsic_hash == _EXT_HASH
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_submit_still_raises_real_errors():
+    """Only the already-imported outcome is translated; genuine submission failures must propagate."""
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+
+    async def rpc_request(method, params, **kwargs):
+        raise SubstrateRequestException(
+            "Invalid Transaction: Inability to pay some fees"
+        )
+
+    substrate.rpc_request = rpc_request
+    with pytest.raises(SubstrateRequestException, match="Inability to pay"):
+        await substrate.submit_extrinsic(_fake_extrinsic())

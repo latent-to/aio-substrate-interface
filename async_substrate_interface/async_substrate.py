@@ -4933,10 +4933,25 @@ class AsyncSubstrateInterface(SubstrateMixin):
             )
 
         else:
-            response = await self.rpc_request("author_submitExtrinsic", [extrinsic_hex])
+            try:
+                response = await self.rpc_request(
+                    "author_submitExtrinsic", [extrinsic_hex]
+                )
+                submitted_hash = response["result"]
+            except SubstrateRequestException as e:
+                if "already imported" not in str(e).lower():
+                    raise
+                # The node already has this extrinsic even though this call errored — most
+                # likely a reconnection re-sent an in-flight submission. The submission itself
+                # succeeded, and the hash is deterministic from the signed bytes.
+                logger.info(
+                    f"Extrinsic {extrinsic_hash} was already imported by the node "
+                    f"(likely resubmitted by a reconnection); treating as submitted."
+                )
+                submitted_hash = extrinsic_hash
 
             result = AsyncExtrinsicReceipt(
-                substrate=self, extrinsic_hash=response["result"]
+                substrate=self, extrinsic_hash=submitted_hash
             )
 
         return result
