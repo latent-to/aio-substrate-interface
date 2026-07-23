@@ -1089,7 +1089,10 @@ class Websocket:
                         pass
                 if self.ws is not None:
                     self._exit_task = asyncio.create_task(self._exit_with_timer())
-        self._attempts = 0
+        # NOTE: `_attempts` is deliberately not reset here. It is reset by `_start_receiving`
+        # on successful traffic and by `_restart_handler_if_dead` when reviving a dead handler;
+        # resetting it on every context exit would let concurrent requests wipe the shared retry
+        # counter mid-reconnect, making `max_retries` unreachable under load.
 
     async def _exit_with_timer(self):
         """
