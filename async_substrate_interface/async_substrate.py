@@ -971,7 +971,9 @@ class Websocket:
                     pass
 
             for task in done:
-                task_res = task.result()
+                # The pump tasks return their errors, but a raise (a bug in their own except
+                # blocks) must flow through the same triage rather than crash the handler.
+                task_res = task.exception() or task.result()
 
                 # If ConnectionClosedOK, graceful shutdown - don't reconnect
                 if (
@@ -988,11 +990,16 @@ class Websocket:
                     logger.debug(f"Reconnection triggered by: {reconnect_trigger}")
 
             if not should_reconnect:
-                if isinstance(e := recv_task.result(), Exception):
-                    return e
-                elif isinstance(e := send_task.result(), Exception):
-                    return e
-                elif len(self._received_subscriptions) > 0:
+                # The task from `pending` was cancelled above: `.result()` on it would raise
+                # CancelledError, making the handler task itself read as cancelled — and
+                # `retrieve` deliberately ignores cancelled handlers, so consumers would then
+                # poll forever instead of receiving the real error.
+                for task in (recv_task, send_task):
+                    if task.cancelled():
+                        continue
+                    if isinstance(e := task.exception() or task.result(), Exception):
+                        return e
+                if len(self._received_subscriptions) > 0:
                     return SubstrateRequestException(
                         "Currently open subscriptions while disconnecting. "
                         "Ensure these are unsubscribed from before closing in the future."

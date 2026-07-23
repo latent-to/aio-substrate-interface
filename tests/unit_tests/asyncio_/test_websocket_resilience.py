@@ -484,6 +484,38 @@ async def test_orphaned_subscription_fails_consumer_on_next_retrieve():
 
 
 @pytest.mark.asyncio
+async def test_handler_reports_error_when_sibling_task_was_cancelled():
+    """
+    When one pump task dies with a non-reconnect exception, the still-pending sibling is cancelled.
+    Reading the cancelled sibling's `.result()` raised CancelledError pre-fix, which made the handler
+    task itself read as cancelled — and `retrieve` deliberately ignores cancelled handlers, so
+    consumers polled None forever instead of receiving the real error.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+    boom = ValueError("malformed frame")
+
+    async def hanging_recv(_ws):
+        await asyncio.sleep(3600)
+
+    async def failing_send(_ws):
+        return boom
+
+    ws._start_receiving = hanging_recv
+    ws._start_sending = failing_send
+
+    handler = asyncio.ensure_future(ws._handler(MagicMock()))
+    await asyncio.wait([handler], timeout=5)
+    assert handler.done()
+    assert not handler.cancelled()
+    assert handler.result() is boom
+
+    # consumers polling retrieve must now receive the real error
+    ws._send_recv_task = handler
+    with pytest.raises(ValueError, match="malformed frame"):
+        await ws.retrieve("anything")
+
+
+@pytest.mark.asyncio
 async def test_revived_handler_orphans_and_recovers_subscriptions():
     """
     Reviving a dead handler must apply the same subscription policy as the handler's own reconnect
