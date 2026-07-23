@@ -1008,7 +1008,32 @@ class Websocket:
                         await self._sending.put(parsed)
 
             logger.debug("Attempting reconnection...")
-            await self.connect(True)
+            while True:
+                try:
+                    await self.connect(True)
+                    break
+                except (
+                    OSError,
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    websockets.exceptions.InvalidHandshake,
+                ) as connect_error:
+                    # The endpoint may be briefly unreachable at exactly the moment we try to
+                    # reconnect; that must consume retry budget, not kill the handler (which
+                    # would strand every resubmitted in-flight request).
+                    self._attempts += 1
+                    if self._attempts >= self._max_retries:
+                        logger.error(
+                            f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                            f"Max retries exceeded."
+                        )
+                        return connect_error
+                    delay = min(2**self._attempts, 30)
+                    logger.warning(
+                        f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                        f"Retrying in {delay}s. Attempt {self._attempts} of {self._max_retries}."
+                    )
+                    await asyncio.sleep(delay)
             logger.debug(f"Reconnected. Send queue size: {self._sending.qsize()}")
             if self._subscription_recoverers:
                 # Run recovery concurrently with the recursed handler below: the recoverers make RPC
