@@ -943,7 +943,7 @@ class Websocket:
                 raise
             loop = asyncio.get_running_loop()
             should_reconnect = False
-            is_retry = False
+            reconnect_trigger = ""
 
             for task in pending:
                 task.cancel()
@@ -966,13 +966,8 @@ class Websocket:
                 # Check for timeout/connection errors that should trigger reconnect
                 if isinstance(task_res, RECONNECT_EXCEPTIONS):
                     should_reconnect = True
-                    logger.debug(
-                        f"Reconnection triggered by: {type(task_res).__name__}"
-                    )
-
-                if isinstance(task_res, (asyncio.TimeoutError, TimeoutError)):
-                    self._attempts += 1
-                    is_retry = True
+                    reconnect_trigger = type(task_res).__name__
+                    logger.debug(f"Reconnection triggered by: {reconnect_trigger}")
 
             if not should_reconnect:
                 if isinstance(e := recv_task.result(), Exception):
@@ -1000,13 +995,19 @@ class Websocket:
                     f"with no recovery handler: {unrecoverable_subscriptions}"
                 )
 
-            if is_retry:
-                if self._attempts >= self._max_retries:
-                    logger.error("Max retries exceeded.")
-                    return TimeoutError("Max retries exceeded.")
-                logger.info(
-                    f"Timeout occurred. Reconnecting. Attempt {self._attempts} of {self._max_retries}"
-                )
+            # Every reconnect trigger — timeout or abnormal close — consumes retry budget;
+            # `_start_receiving` resets the counter as soon as traffic flows again, so the cap
+            # is only reached by consecutive failures with no successful traffic in between.
+            # Without this, a server that accepts connections and immediately closes them
+            # would be hammered in an unbounded tight loop.
+            self._attempts += 1
+            if self._attempts >= self._max_retries:
+                logger.error("Max retries exceeded.")
+                return TimeoutError("Max retries exceeded.")
+            logger.info(
+                f"Connection lost ({reconnect_trigger}). Reconnecting. "
+                f"Attempt {self._attempts} of {self._max_retries}"
+            )
 
             async with self._lock:
                 resent_batches: set[str] = set()
@@ -1030,6 +1031,11 @@ class Websocket:
                         logger.debug(f"Resubmitting {parsed['id']}")
                         await self._sending.put(parsed)
 
+            if self._attempts > 1:
+                # repeated failures without any successful traffic in between: back off
+                backoff = min(2 ** (self._attempts - 1), 30)
+                logger.debug(f"Backing off {backoff}s before reconnecting")
+                await asyncio.sleep(backoff)
             logger.debug("Attempting reconnection...")
             while True:
                 try:
