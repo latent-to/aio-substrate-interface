@@ -455,6 +455,78 @@ async def test_reconnect_survives_concurrent_consumer_connects():
             await ws.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_orphaned_subscription_fails_consumer_on_next_retrieve():
+    """
+    A subscription with no recoverer cannot survive a reconnect. Instead of silently orphaning it
+    (pre-fix, its consumer polled an abandoned queue forever) or refusing to reconnect at all
+    (pre-fix, the handler path stranded every other request over it), it is dropped and its
+    consumer's next `retrieve` raises. Recoverable subscriptions are untouched.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        return "rec-sub-new"
+
+    ws.register_subscription_recoverer("rec-sub", recoverer)
+    ws._received_subscriptions["orphan-sub"] = asyncio.Queue()
+
+    orphaned = ws._orphan_unrecoverable_subscriptions()
+
+    assert orphaned == ["orphan-sub"]
+    assert "orphan-sub" not in ws._received_subscriptions
+    assert "rec-sub" in ws._received_subscriptions
+
+    with pytest.raises(SubstrateRequestException, match="no recovery handler"):
+        await ws.retrieve("orphan-sub")
+    # delivered once; subsequent polls see a plain miss, not a repeat error
+    assert await ws.retrieve("orphan-sub") is None
+
+
+@pytest.mark.asyncio
+async def test_revived_handler_orphans_and_recovers_subscriptions():
+    """
+    Reviving a dead handler must apply the same subscription policy as the handler's own reconnect
+    path: recoverable subscriptions are re-established (pre-fix they were silently forgotten), and
+    unrecoverable ones are failed explicitly (pre-fix they were silently orphaned).
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def _dead():
+        return TimeoutError("Max retries exceeded.")
+
+    ws._send_recv_task = asyncio.ensure_future(_dead())
+    await ws._send_recv_task
+
+    recoverer_calls = []
+
+    async def recoverer():
+        recoverer_calls.append(True)
+        return "rec-sub-new"
+
+    ws.register_subscription_recoverer("rec-sub", recoverer)
+    ws._received_subscriptions["orphan-sub"] = asyncio.Queue()
+
+    async def fake_connect_internal(force):
+        ws.ws = MagicMock(state=State.OPEN)
+        ws._send_recv_task = asyncio.ensure_future(asyncio.sleep(3600))
+
+    ws._connect_internal = fake_connect_internal
+
+    try:
+        await ws.__aenter__()
+        await asyncio.gather(*ws._recovery_tasks)
+
+        assert recoverer_calls == [True]
+        assert ws._sub_original_to_alias == {"rec-sub": "rec-sub-new"}
+        with pytest.raises(SubstrateRequestException, match="no recovery handler"):
+            await ws.retrieve("orphan-sub")
+    finally:
+        ws._send_recv_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ws._send_recv_task
+
+
 # --- Extrinsic recovery chain queries ------------------------------------------------------------
 
 

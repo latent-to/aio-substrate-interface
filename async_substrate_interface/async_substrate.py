@@ -657,6 +657,7 @@ class Websocket:
             str, Callable[[], Awaitable[Optional[str]]]
         ] = {}
         self._recovering_subscriptions: set[str] = set()
+        self._orphaned_subscriptions: set[str] = set()
         self._recovery_tasks: set[asyncio.Task] = set()
         # maps between the subscription ids consumers hold and the ids the server currently
         # knows them by (these diverge when a recovery re-establishes a subscription)
@@ -698,7 +699,14 @@ class Websocket:
                 # Consume the dead task's outcome so it is not later reported as an unretrieved exception.
                 task.exception()
             self._attempts = 0
+            # Same policy as the handler's reconnect path: subscriptions the dead handler left behind
+            # are re-established when they have a recoverer, and failed explicitly when they do not.
+            self._orphan_unrecoverable_subscriptions()
             await self._connect_internal(force=True)
+        if self._subscription_recoverers:
+            recovery_task = asyncio.create_task(self._recover_subscriptions())
+            self._recovery_tasks.add(recovery_task)
+            recovery_task.add_done_callback(self._recovery_tasks.discard)
 
     async def mark_waiting_for_response(self):
         """
@@ -992,18 +1000,10 @@ class Websocket:
                 return None
 
             # Subscriptions cannot be resumed server-side after a reconnect. Those registered with a
-            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others make
-            # reconnection impossible.
-            if unrecoverable_subscriptions := [
-                sub_id
-                for sub_id in self._received_subscriptions
-                if sub_id not in self._subscription_recoverers
-                and sub_id not in self._recovering_subscriptions
-            ]:
-                return SubstrateRequestException(
-                    "Unable to reconnect because there are currently open subscriptions "
-                    f"with no recovery handler: {unrecoverable_subscriptions}"
-                )
+            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others are
+            # failed explicitly so their consumers get an error on their next poll instead of a
+            # silent hang, and so the reconnect can proceed for everyone else.
+            self._orphan_unrecoverable_subscriptions()
 
             # Every reconnect trigger — timeout or abnormal close — consumes retry budget;
             # `_start_receiving` resets the counter as soon as traffic flows again, so the cap
@@ -1337,6 +1337,7 @@ class Websocket:
             logger.debug(f"Unwatched extrinsic subscription {subscription_id}")
             self._received_subscriptions.pop(subscription_id, None)
             self._subscription_recoverers.pop(subscription_id, None)
+            self._orphaned_subscriptions.discard(subscription_id)
             # a recovered subscription is known to the server by its aliased id
             server_subscription_id = self._sub_original_to_alias.pop(
                 subscription_id, subscription_id
@@ -1361,8 +1362,8 @@ class Websocket:
         the subscription is open.
 
         Server-side subscription state does not survive a reconnection, so without a recoverer an open
-        subscription prevents reconnecting entirely. With one, the reconnect proceeds and the recoverer is
-        awaited afterward. The recoverer must either:
+        subscription is failed on reconnect: its consumer's next `retrieve` raises. With a recoverer, the
+        subscription is re-established after reconnecting. The recoverer must either:
 
         - return a new server-side subscription id (from re-establishing the subscription), which is then
           aliased to `subscription_id` so the consumer polling the original id keeps receiving messages
@@ -1403,6 +1404,32 @@ class Websocket:
             )
             return
         await queue.put(message)
+
+    def _orphan_unrecoverable_subscriptions(self) -> list[str]:
+        """
+        Fails every open subscription that has no recoverer (and is not mid-recovery from an earlier
+        reconnection): server-side subscription state does not survive a reconnect, so these can never
+        produce another message. Each is dropped from the open set — so it cannot hold the connection
+        open or linger across reconnects — and marked orphaned, making its consumer's next `retrieve`
+        raise instead of polling an abandoned queue forever.
+
+        Returns the orphaned subscription ids.
+        """
+        orphaned = [
+            sub_id
+            for sub_id in self._received_subscriptions
+            if sub_id not in self._subscription_recoverers
+            and sub_id not in self._recovering_subscriptions
+        ]
+        for sub_id in orphaned:
+            del self._received_subscriptions[sub_id]
+            self._orphaned_subscriptions.add(sub_id)
+        if orphaned:
+            logger.error(
+                f"Open subscriptions with no recovery handler cannot survive a reconnection "
+                f"and have been dropped: {orphaned}"
+            )
+        return orphaned
 
     async def _recover_subscriptions(self) -> None:
         """
@@ -1484,6 +1511,13 @@ class Websocket:
                 del self._received[item_id]
                 return res
         else:
+            if item_id in self._orphaned_subscriptions:
+                # delivered once; the consumer is expected to stop polling after this
+                self._orphaned_subscriptions.discard(item_id)
+                raise SubstrateRequestException(
+                    f"Subscription {item_id} was severed by a reconnection and cannot be "
+                    f"resumed because it has no recovery handler."
+                )
             try:
                 subscription = self._received_subscriptions[item_id].get_nowait()
                 self._received_subscriptions[item_id].task_done()
