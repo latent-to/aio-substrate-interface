@@ -29,29 +29,6 @@ pip install aio-substrate-interface
 
 ## Usage
 
-Here are examples of how to use the sync and async interfaces:
-
-```python
-from async_substrate_interface import SubstrateInterface
-
-
-def main():
-    substrate = SubstrateInterface(
-        url="wss://rpc.polkadot.io"
-    )
-    with substrate:
-        result = substrate.query(
-            module='System',
-            storage_function='Account',
-            params=['5CZs3T15Ky4jch1sUpSFwkUbYEnsCfe1WCY51fH3SPV6NFnf']
-        )
-
-        print(result)
-
-
-main()
-```
-
 ```python
 import asyncio
 from async_substrate_interface import AsyncSubstrateInterface
@@ -101,30 +78,13 @@ bh1, bh2 = await asyncio.gather(
 it would actually only make one single network call, and return the result to both requests. Like `SubstrateInterface`,
 it also takes the `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE` vars to set cache size.
 
-The third and final caching mechanism we use is
-`async_substrate_interface.async_substrate.DiskCachedAsyncSubstrateInterface`,
-which functions the same as the normal `AsyncSubstrateInterface`, but that also saves this cache to the disk, so the
-cache
-is preserved between runs. This is product for a fairly nice use-case (such as `btcli`). As you may call different
-networks
-with entirely different results, this cache is keyed by the uri supplied at instantiation of the
-`DiskCachedAsyncSubstrateInterface`
-object, so `DiskCachedAsyncSubstrateInterface(network_1)` and `DiskCachedAsyncSubstrateInterface(network_2)` will not
-share the same on-disk cache.
-
-As with the other two caches, this also takes `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE` env vars.
-
 ### ENV VARS
 
-The following environment variables are used within async-substrate-interface
+The following environment variables are used within aio-substrate-interface
 
-- NO_CACHE (default 0): if set to 1, when using the DiskCachedAsyncSubstrateInterface class, no persistent on-disk cache
-  will be stored, instead using only in-memory cache.
-- CACHE_LOCATION (default `~/.cache/async-substrate-interface`): this determines the location for the cache file, if
-  using DiskCachedAsyncSubstrateInterface
-- SUBSTRATE_CACHE_METHOD_SIZE (default 512): the cache size (either in-memory or on-disk) of the smaller return-size
+- SUBSTRATE_CACHE_METHOD_SIZE (default 512): the cache size of the smaller return-size
   methods (see the Caching section for more info)
-- SUBSTRATE_RUNTIME_CACHE_SIZE (default 16): the cache size (either in-memory or on-disk) of the larger return-size
+- SUBSTRATE_RUNTIME_CACHE_SIZE (default 16): the cache size of the larger return-size
   methods (see the Caching section for more info)
 - SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH (default 16): how many blocks are walked back per check when recovering a
   watched extrinsic whose subscription was severed by a websocket reconnection
