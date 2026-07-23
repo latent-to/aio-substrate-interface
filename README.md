@@ -126,6 +126,12 @@ The following environment variables are used within async-substrate-interface
   methods (see the Caching section for more info)
 - SUBSTRATE_RUNTIME_CACHE_SIZE (default 16): the cache size (either in-memory or on-disk) of the larger return-size
   methods (see the Caching section for more info)
+- SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH (default 16): how many blocks are walked back per check when recovering a
+  watched extrinsic whose subscription was severed by a websocket reconnection
+- SUBSTRATE_EXTRINSIC_RECOVERY_TIMEOUT (default 120): seconds to wait for inclusion/finalization of an
+  already-submitted extrinsic when its watch subscription is being recovered by polling
+- SUBSTRATE_EXTRINSIC_RECOVERY_POLL_INTERVAL (default 1): seconds between chain polls while recovering a watched
+  extrinsic
 
 ## Contributing
 

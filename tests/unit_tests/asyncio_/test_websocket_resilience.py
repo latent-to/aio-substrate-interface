@@ -14,15 +14,18 @@ owns that single release, so a mid-flight transport error can never double-relea
 
 import asyncio
 from contextlib import suppress
+from hashlib import blake2b
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from websockets.protocol import State
 
+import async_substrate_interface.async_substrate
 from async_substrate_interface.async_substrate import (
     AsyncSubstrateInterface,
     Websocket,
 )
+from async_substrate_interface.errors import SubstrateRequestException
 
 
 def _make_payload(id_: str) -> dict:
@@ -227,3 +230,199 @@ async def test_failed_retrieve_then_discard_releases_permit_once():
     assert ws.max_subscriptions._value == permits_after_send + 1
     assert item_id not in ws._received
     assert item_id not in ws._inflight
+
+
+# --- Subscription recovery after reconnection ---------------------------------------------------
+
+
+def _sub_message(sub_id: str, result) -> dict:
+    return {"jsonrpc": "2.0", "params": {"subscription": sub_id, "result": result}}
+
+
+@pytest.mark.asyncio
+async def test_recovered_subscription_is_aliased_to_original_id():
+    """
+    A recoverer that re-establishes its subscription returns the new server-side id; messages arriving
+    under that id must be routed to the original consumer queue, and `unsubscribe` must both address the
+    server by the new id and clean up all recovery state.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        return "new-sub"
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    # tracked (and therefore recoverable/connection-keeping) even before any notification arrives
+    assert "old-sub" in ws._received_subscriptions
+
+    await ws._recover_subscriptions()
+
+    await ws._dispatch_response(_sub_message("new-sub", {"inBlock": "0xabc"}))
+    queued = ws._received_subscriptions["old-sub"].get_nowait()
+    assert queued["params"]["result"] == {"inBlock": "0xabc"}
+
+    await ws.unsubscribe("old-sub")
+    sent = await ws._sending.get()
+    assert sent["params"] == ["new-sub"]
+    assert "old-sub" not in ws._subscription_recoverers
+    assert "old-sub" not in ws._received_subscriptions
+    assert ws._sub_alias_to_original == {}
+    assert ws._sub_original_to_alias == {}
+
+
+@pytest.mark.asyncio
+async def test_recovery_drains_messages_that_raced_in_under_new_id():
+    """Notifications that arrive under the new id before the alias is registered must not be lost."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        await ws._dispatch_response(_sub_message("new-sub", "early"))
+        return "new-sub"
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    assert "new-sub" not in ws._received_subscriptions
+    early = ws._received_subscriptions["old-sub"].get_nowait()
+    assert early["params"]["result"] == "early"
+
+
+@pytest.mark.asyncio
+async def test_recoverer_can_settle_subscription_by_injection():
+    """A recoverer that resolves the subscription out-of-band injects terminal messages and returns None."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        await ws.inject_subscription_message(
+            "old-sub", _sub_message("old-sub", {"finalized": "0xdef"})
+        )
+        return None
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    settled = ws._received_subscriptions["old-sub"].get_nowait()
+    assert settled["params"]["result"] == {"finalized": "0xdef"}
+    assert ws._sub_alias_to_original == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_injects_recovery_failed_message():
+    """A raising recoverer must surface a recoveryFailed message for the consumer instead of vanishing."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        raise SubstrateRequestException("node unreachable")
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    message = ws._received_subscriptions["old-sub"].get_nowait()
+    assert message["params"]["result"] == {"recoveryFailed": "node unreachable"}
+    assert "old-sub" not in ws._recovering_subscriptions
+
+
+# --- Extrinsic recovery chain queries ------------------------------------------------------------
+
+
+_EXT_HEX = "0x280403000b63ce64c10c05"
+_EXT_HASH = f"0x{blake2b(bytes.fromhex(_EXT_HEX[2:]), digest_size=32).hexdigest()}"
+
+
+def _block(number: int, parent: str, extrinsics: list[str]) -> dict:
+    return {
+        "header": {"number": hex(number), "parentHash": parent},
+        "extrinsics": extrinsics,
+    }
+
+
+def _substrate_with_chain(blocks: dict[str, dict], heads: list[str]):
+    """
+    An interface whose `rpc_request` serves a static chain: `blocks` maps block hash to a
+    `chain_getBlock` block, and each head request pops the next entry of `heads` (the last is sticky).
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+    remaining_heads = list(heads)
+
+    async def rpc_request(method, params, **kwargs):
+        if method == "chain_getBlock":
+            return {"result": {"block": blocks[params[0]]}}
+        if method in ("chain_getBlockHash", "chain_getFinalizedHead"):
+            return {
+                "result": remaining_heads.pop(0)
+                if len(remaining_heads) > 1
+                else remaining_heads[0]
+            }
+        raise AssertionError(f"Unexpected RPC method {method}")
+
+    substrate.rpc_request = rpc_request
+    return substrate
+
+
+@pytest.mark.asyncio
+async def test_scan_recent_blocks_finds_included_extrinsic():
+    blocks = {
+        "0xb2": _block(2, "0xb1", []),
+        "0xb1": _block(1, "0xb0", [_EXT_HEX]),
+        "0xb0": _block(0, "0x00", []),
+    }
+    substrate = _substrate_with_chain(blocks, ["0xb2"])
+
+    scanned: set[str] = set()
+    found = await substrate._scan_recent_blocks_for_extrinsic(
+        _EXT_HASH, "0xb2", 16, scanned
+    )
+    assert found == "0xb1"
+    assert scanned == {"0xb2", "0xb1"}
+
+    # an unknown extrinsic walks back to genesis and gives up
+    assert (
+        await substrate._scan_recent_blocks_for_extrinsic("0xdead", "0xb2", 16, set())
+        is None
+    )
+    # already-scanned blocks are not re-fetched
+    assert (
+        await substrate._scan_recent_blocks_for_extrinsic("0xdead", "0xb2", 16, scanned)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_polling_watch_sees_extrinsic_included_in_later_block(monkeypatch):
+    """The polling watcher finds an extrinsic that lands in a block only after the first poll."""
+    monkeypatch.setattr(
+        async_substrate_interface.async_substrate,
+        "EXTRINSIC_RECOVERY_POLL_INTERVAL",
+        0.01,
+    )
+    blocks = {
+        "0xb2": _block(2, "0xb1", [_EXT_HEX]),
+        "0xb1": _block(1, "0xb0", []),
+        "0xb0": _block(0, "0x00", []),
+    }
+    substrate = _substrate_with_chain(blocks, ["0xb1", "0xb2"])
+
+    result = await substrate._wait_for_extrinsic_inclusion_via_polling(
+        _EXT_HASH, False, timeout=5
+    )
+    assert result == {
+        "block_hash": "0xb2",
+        "extrinsic_hash": _EXT_HASH,
+        "finalized": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_polling_watch_times_out(monkeypatch):
+    monkeypatch.setattr(
+        async_substrate_interface.async_substrate,
+        "EXTRINSIC_RECOVERY_POLL_INTERVAL",
+        0.01,
+    )
+    blocks = {"0xb0": _block(0, "0x00", [])}
+    substrate = _substrate_with_chain(blocks, ["0xb0"])
+
+    with pytest.raises(SubstrateRequestException, match="not observed within"):
+        await substrate._wait_for_extrinsic_inclusion_via_polling(
+            _EXT_HASH, True, timeout=0.05
+        )

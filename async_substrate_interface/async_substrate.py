@@ -13,6 +13,7 @@ import ssl
 import time
 import warnings
 from contextlib import suppress
+from functools import partial
 from unittest.mock import AsyncMock
 from hashlib import blake2b
 from typing import (
@@ -99,6 +100,17 @@ raw_websocket_logger = logging.getLogger("raw_websocket")
 SUBSTRATE_CACHE_METHOD_SIZE = int(os.getenv("SUBSTRATE_CACHE_METHOD_SIZE", "512"))
 SUBSTRATE_RUNTIME_CACHE_SIZE = int(os.getenv("SUBSTRATE_RUNTIME_CACHE_SIZE", "16"))
 SSL_SESSION_TTL = int(os.getenv("SUBSTRATE_SSL_SESSION_TTL", "300"))
+
+# tuning for recovering extrinsic-watch subscriptions severed by a websocket reconnection
+EXTRINSIC_RECOVERY_SCAN_DEPTH = int(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH", "16")
+)
+EXTRINSIC_RECOVERY_TIMEOUT = float(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_TIMEOUT", "120")
+)
+EXTRINSIC_RECOVERY_POLL_INTERVAL = float(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_POLL_INTERVAL", "1")
+)
 
 
 class AsyncExtrinsicReceipt:
@@ -630,6 +642,15 @@ class Websocket:
             self._options["ssl"] = ssl_context
         self._dns_ttl = dns_ttl
         self._dns_cache: Optional[tuple[list, float]] = None
+        self._subscription_recoverers: dict[
+            str, Callable[[], Awaitable[Optional[str]]]
+        ] = {}
+        self._recovering_subscriptions: set[str] = set()
+        self._recovery_tasks: set[asyncio.Task] = set()
+        # maps between the subscription ids consumers hold and the ids the server currently
+        # knows them by (these diverge when a recovery re-establishes a subscription)
+        self._sub_alias_to_original: dict[str, str] = {}
+        self._sub_original_to_alias: dict[str, str] = {}
 
     @property
     def state(self):
@@ -920,9 +941,18 @@ class Websocket:
                 is_retry = True
 
         if should_reconnect is True:
-            if len(self._received_subscriptions) > 0:
+            # Subscriptions cannot be resumed server-side after a reconnect. Those registered with a
+            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others make
+            # reconnection impossible.
+            if unrecoverable_subscriptions := [
+                sub_id
+                for sub_id in self._received_subscriptions
+                if sub_id not in self._subscription_recoverers
+                and sub_id not in self._recovering_subscriptions
+            ]:
                 return SubstrateRequestException(
-                    "Unable to reconnect because there are currently open subscriptions."
+                    "Unable to reconnect because there are currently open subscriptions "
+                    f"with no recovery handler: {unrecoverable_subscriptions}"
                 )
 
             if is_retry:
@@ -958,6 +988,12 @@ class Websocket:
             logger.debug("Attempting reconnection...")
             await self.connect(True)
             logger.debug(f"Reconnected. Send queue size: {self._sending.qsize()}")
+            if self._subscription_recoverers:
+                # Run recovery concurrently with the recursed handler below: the recoverers make RPC
+                # requests over this websocket, which need the send/recv tasks to be running.
+                recovery_task = asyncio.create_task(self._recover_subscriptions())
+                self._recovery_tasks.add(recovery_task)
+                recovery_task.add_done_callback(self._recovery_tasks.discard)
             # Recursively call handler
             assert self.ws is not None
             return await self._handler(self.ws)
@@ -1054,6 +1090,9 @@ class Websocket:
             self._in_use_ids.discard(response["id"])
         elif "params" in response:
             sub_id = response["params"]["subscription"]
+            # a recovered subscription's messages arrive under its new server-side id, but its
+            # consumer still polls the original id
+            sub_id = self._sub_alias_to_original.get(sub_id, sub_id)
             if sub_id not in self._received_subscriptions:
                 self._received_subscriptions[sub_id] = asyncio.Queue()
             await self._received_subscriptions[sub_id].put(response)
@@ -1227,14 +1266,135 @@ class Websocket:
                 original_id = get_next_id()
             logger.debug(f"Unwatched extrinsic subscription {subscription_id}")
             self._received_subscriptions.pop(subscription_id, None)
+            self._subscription_recoverers.pop(subscription_id, None)
+            # a recovered subscription is known to the server by its aliased id
+            server_subscription_id = self._sub_original_to_alias.pop(
+                subscription_id, subscription_id
+            )
+            self._sub_alias_to_original.pop(server_subscription_id, None)
 
         to_send = {
             "jsonrpc": "2.0",
             "id": original_id,
             "method": method,
-            "params": [subscription_id],
+            "params": [server_subscription_id],
         }
         await self._sending.put(to_send)
+
+    def register_subscription_recoverer(
+        self,
+        subscription_id: str,
+        recoverer: Callable[[], Awaitable[Optional[str]]],
+    ) -> None:
+        """
+        Registers a coroutine function used to recover `subscription_id` if the connection is lost while
+        the subscription is open.
+
+        Server-side subscription state does not survive a reconnection, so without a recoverer an open
+        subscription prevents reconnecting entirely. With one, the reconnect proceeds and the recoverer is
+        awaited afterward. The recoverer must either:
+
+        - return a new server-side subscription id (from re-establishing the subscription), which is then
+          aliased to `subscription_id` so the consumer polling the original id keeps receiving messages
+          transparently;
+        - return None after having settled the subscription itself (typically by injecting terminal
+          messages with `inject_subscription_message`); or
+        - raise, in which case a message whose result is `{"recoveryFailed": <error>}` is injected for the
+          consumer to handle.
+
+        Args:
+            subscription_id: id of the subscription, as returned by the subscribe RPC call
+            recoverer: no-argument coroutine function implementing the contract above
+        """
+        if subscription_id not in self._received_subscriptions:
+            # ensure the subscription is tracked (keeping the connection open, and marking it as
+            # recoverable during reconnection) even before its first notification arrives
+            self._received_subscriptions[subscription_id] = asyncio.Queue()
+        self._subscription_recoverers[subscription_id] = recoverer
+
+    async def inject_subscription_message(
+        self, subscription_id: str, message: dict
+    ) -> None:
+        """
+        Puts a message on the queue of an open subscription, as though it had been received from the
+        server. Used by subscription recoverers to settle subscriptions they have resolved out-of-band.
+        Messages for subscriptions that are no longer open are dropped.
+
+        Args:
+            subscription_id: id of the subscription whose consumer should receive the message
+            message: the message dict, shaped like a subscription notification
+        """
+        queue = self._received_subscriptions.get(subscription_id)
+        if queue is None:
+            # already unsubscribed — recreating the queue here would orphan it, keeping the
+            # connection open and blocking future reconnects forever
+            logger.debug(
+                f"Dropping injected message for closed subscription {subscription_id}"
+            )
+            return
+        await queue.put(message)
+
+    async def _recover_subscriptions(self) -> None:
+        """
+        Runs the registered recoverer for every open recoverable subscription following a reconnection.
+        See `register_subscription_recoverer` for the recoverer contract.
+        """
+        to_recover = []
+        for sub_id, recoverer in list(self._subscription_recoverers.items()):
+            if sub_id in self._recovering_subscriptions:
+                # still being recovered from a previous reconnection
+                continue
+            # claimed synchronously, so overlapping recovery runs cannot double-recover
+            self._recovering_subscriptions.add(sub_id)
+            to_recover.append((sub_id, recoverer))
+        await asyncio.gather(
+            *(
+                self._recover_subscription(sub_id, recoverer)
+                for sub_id, recoverer in to_recover
+            )
+        )
+
+    async def _recover_subscription(
+        self,
+        subscription_id: str,
+        recoverer: Callable[[], Awaitable[Optional[str]]],
+    ) -> None:
+        try:
+            new_subscription_id = await recoverer()
+            if subscription_id not in self._subscription_recoverers:
+                # unsubscribed while recovery was running
+                return
+            if new_subscription_id is not None:
+                async with self._lock:
+                    stale_alias = self._sub_original_to_alias.pop(subscription_id, None)
+                    if stale_alias is not None:
+                        self._sub_alias_to_original.pop(stale_alias, None)
+                    self._sub_original_to_alias[subscription_id] = new_subscription_id
+                    self._sub_alias_to_original[new_subscription_id] = subscription_id
+                    # grab any messages that arrived under the new id before the alias was in place
+                    early_messages = self._received_subscriptions.pop(
+                        new_subscription_id, None
+                    )
+                while early_messages is not None and not early_messages.empty():
+                    await self.inject_subscription_message(
+                        subscription_id, early_messages.get_nowait()
+                    )
+        except Exception as e:
+            logger.error(
+                f"Failed to recover subscription {subscription_id} after reconnection: {e}"
+            )
+            await self.inject_subscription_message(
+                subscription_id,
+                {
+                    "jsonrpc": "2.0",
+                    "params": {
+                        "subscription": subscription_id,
+                        "result": {"recoveryFailed": str(e)},
+                    },
+                },
+            )
+        finally:
+            self._recovering_subscriptions.discard(subscription_id)
 
     async def retrieve(self, item_id: str) -> Optional[dict]:
         """
@@ -2740,6 +2900,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         result_handler: Optional[ResultHandler] = None,
         runtime: Optional[Runtime] = None,
         result_processor: Optional[Callable[[dict, str | int], Any]] = None,
+        subscription_recoverer: Optional[
+            Callable[[str], Awaitable[Optional[str]]]
+        ] = None,
     ) -> RequestResults:
         """
         Sends a batch of RPC payloads over the websocket and gathers their responses, optionally decoding
@@ -2755,6 +2918,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 arrives, receiving `(response, item_id)`; its return value replaces the raw response stored in
                 the result map. Lets callers overlap CPU-bound post-processing (e.g. SCALE decoding) with the
                 network wait for the remaining payloads. Mutually exclusive with `result_handler`.
+            subscription_recoverer: optional coroutine function called with the subscription id if the
+                websocket reconnects while the subscription created by these payloads is open; see
+                `Websocket.register_subscription_recoverer` for the contract. Only meaningful together
+                with `result_handler` on subscription-creating payloads.
 
         Returns:
             mapping of payload id to the list of (possibly processed) responses received for that request
@@ -2799,6 +2966,13 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             item_id, response["result"]
                                         )
                                         subscription_added = True
+                                        if subscription_recoverer is not None:
+                                            ws.register_subscription_recoverer(
+                                                item_id,
+                                                partial(
+                                                    subscription_recoverer, item_id
+                                                ),
+                                            )
                                     except KeyError:
                                         logger.error(
                                             f"Error received from subtensor for {item_id}: {response}\n"
@@ -4359,6 +4533,111 @@ class AsyncSubstrateInterface(SubstrateMixin):
             signature=signature,
         )
 
+    @staticmethod
+    def _extrinsic_hashes_in_block(block: dict) -> list[str]:
+        """Computes the hash of each raw extrinsic in the block of a `chain_getBlock` response."""
+        return [
+            f"0x{blake2b(hex_to_bytes(extrinsic), digest_size=32).hexdigest()}"
+            for extrinsic in block["extrinsics"]
+        ]
+
+    async def _scan_recent_blocks_for_extrinsic(
+        self,
+        extrinsic_hash: str,
+        start_block_hash: str,
+        max_depth: int,
+        known_block_hashes: set[str],
+    ) -> Optional[str]:
+        """
+        Walks backwards from `start_block_hash` through at most `max_depth` blocks, looking for an
+        extrinsic with hash `extrinsic_hash` in the block bodies.
+
+        Args:
+            extrinsic_hash: "0x"-prefixed hash of the extrinsic to look for
+            start_block_hash: hash of the block to start scanning from (inclusive)
+            max_depth: maximum number of blocks to walk back through
+            known_block_hashes: hashes of blocks already scanned; scanning stops upon reaching one of
+                these, and every newly-scanned block hash is added to the set
+
+        Returns:
+            The hash of the block containing the extrinsic, or None if it was not found.
+        """
+        current_hash = start_block_hash
+        for _ in range(max_depth):
+            if current_hash in known_block_hashes:
+                return None
+            response = await self.rpc_request("chain_getBlock", [current_hash])
+            block = response["result"]["block"]
+            known_block_hashes.add(current_hash)
+            if extrinsic_hash in self._extrinsic_hashes_in_block(block):
+                return current_hash
+            if int(block["header"]["number"], 16) == 0:
+                return None
+            current_hash = block["header"]["parentHash"]
+        return None
+
+    async def _is_extrinsic_in_pool(self, extrinsic_hash: str) -> bool:
+        """Checks whether an extrinsic with the given hash is currently in the node's transaction pool."""
+        response = await self.rpc_request("author_pendingExtrinsics", [])
+        return extrinsic_hash in (
+            f"0x{blake2b(hex_to_bytes(pending), digest_size=32).hexdigest()}"
+            for pending in response["result"]
+        )
+
+    async def _wait_for_extrinsic_inclusion_via_polling(
+        self,
+        extrinsic_hash: str,
+        wait_for_finalization: bool,
+        timeout: float = EXTRINSIC_RECOVERY_TIMEOUT,
+        scan_depth: int = EXTRINSIC_RECOVERY_SCAN_DEPTH,
+    ) -> dict:
+        """
+        Waits for an already-submitted extrinsic to be included in a block (or finalized) by polling block
+        bodies rather than via an author_submitAndWatchExtrinsic subscription. Used to resume watching an
+        extrinsic whose watch subscription was severed by a reconnection, since the author API offers no
+        way to attach a watch to an extrinsic already in the pool.
+
+        Args:
+            extrinsic_hash: "0x"-prefixed hash of the extrinsic being watched
+            wait_for_finalization: if True, polls the finalized chain; otherwise the best chain
+            timeout: seconds to wait for inclusion/finalization before giving up
+            scan_depth: maximum number of blocks walked back per poll
+
+        Returns:
+            dict with "block_hash", "extrinsic_hash", and "finalized" keys (the same shape produced by
+            `submit_extrinsic`'s subscription result handler)
+
+        Raises:
+            SubstrateRequestException: if the extrinsic was not observed before `timeout` elapsed
+        """
+        head_method = (
+            "chain_getFinalizedHead" if wait_for_finalization else "chain_getBlockHash"
+        )
+        scanned: set[str] = set()
+
+        async def _poll() -> dict:
+            while True:
+                head_hash = (await self.rpc_request(head_method, []))["result"]
+                found_hash = await self._scan_recent_blocks_for_extrinsic(
+                    extrinsic_hash, head_hash, scan_depth, scanned
+                )
+                if found_hash is not None:
+                    return {
+                        "block_hash": found_hash,
+                        "extrinsic_hash": extrinsic_hash,
+                        "finalized": wait_for_finalization,
+                    }
+                await asyncio.sleep(EXTRINSIC_RECOVERY_POLL_INTERVAL)
+
+        try:
+            return await asyncio.wait_for(_poll(), timeout)
+        except asyncio.TimeoutError:
+            raise SubstrateRequestException(
+                f"Extrinsic {extrinsic_hash} was submitted, but its "
+                f"{'finalization' if wait_for_finalization else 'inclusion'} was not observed within "
+                f"{timeout}s of the watch subscription being severed."
+            )
+
     async def submit_extrinsic(
         self,
         extrinsic: GenericExtrinsic,
@@ -4382,6 +4661,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         # Check requirements
         if not isinstance(extrinsic, GenericExtrinsic):
             raise TypeError("'extrinsic' must be of type Extrinsic")
+
+        extrinsic_hex = str(extrinsic.data)
+        extrinsic_hash = f"0x{extrinsic.extrinsic_hash.hex()}"
 
         async def result_handler(message: dict, subscription_id) -> tuple[dict, bool]:
             """
@@ -4427,6 +4709,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                     failure_message = (
                         f"Subscription {subscription_id} invalid: {message_result}"
                     )
+                if "recoveryfailed" in message_result:
+                    failure_message = (
+                        f"Subscription {subscription_id} was severed by a websocket reconnection, "
+                        f"and could not be recovered: {message_result}"
+                    )
                 if "future" in message_result:
                     logger.warning(
                         f"Subscription {subscription_id} is temporarily in the local buffer pool,"
@@ -4445,7 +4732,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                         await ws.unsubscribe(subscription_id)
                     return {
                         "block_hash": message_result["finalized"],
-                        "extrinsic_hash": "0x{}".format(extrinsic.extrinsic_hash.hex()),
+                        "extrinsic_hash": extrinsic_hash,
                         "finalized": True,
                     }, True
                 elif (
@@ -4460,7 +4747,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                         "block_hash": message_result.get(
                             "inblock", message_result.get("inBlock")
                         ),
-                        "extrinsic_hash": "0x{}".format(extrinsic.extrinsic_hash.hex()),
+                        "extrinsic_hash": extrinsic_hash,
                         "finalized": False,
                     }, True
 
@@ -4473,19 +4760,91 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
             return message, False
 
-        if wait_for_inclusion or wait_for_finalization:
-            responses = (
-                await self._make_rpc_request(
-                    [
-                        self.make_payload(
-                            "rpc_request",
-                            "author_submitAndWatchExtrinsic",
-                            [str(extrinsic.data)],
-                        )
-                    ],
-                    result_handler=result_handler,
+        async def subscription_recoverer(old_subscription_id: str) -> Optional[str]:
+            """
+            Recovers a severed extrinsic-watch subscription after a websocket reconnection.
+
+            First checks whether the extrinsic already reached the chain (recent blocks, then the
+            transaction pool). If it never arrived, it is resubmitted (the same signed bytes, so the same
+            hash — never a duplicate execution) and the fresh subscription id is returned for aliasing.
+            If it did arrive, inclusion or finalization is instead watched by polling block bodies, and
+            the terminal subscription message is injected so the original watcher completes normally.
+            """
+            logger.warning(
+                f"Extrinsic watch subscription {old_subscription_id} for {extrinsic_hash} was severed "
+                f"by a reconnection. Attempting recovery."
+            )
+            scanned: set[str] = set()
+            best_head = (await self.rpc_request("chain_getBlockHash", []))["result"]
+            included_in = await self._scan_recent_blocks_for_extrinsic(
+                extrinsic_hash, best_head, EXTRINSIC_RECOVERY_SCAN_DEPTH, scanned
+            )
+            if included_in is None and not await self._is_extrinsic_in_pool(
+                extrinsic_hash
+            ):
+                # it never reached the node: resubmit, and resume watching under the new subscription id
+                try:
+                    response_ = await self.rpc_request(
+                        "author_submitAndWatchExtrinsic", [extrinsic_hex]
+                    )
+                    logger.info(
+                        f"Extrinsic {extrinsic_hash} had not been received by the chain. Resubmitted."
+                    )
+                    return response_["result"]
+                except SubstrateRequestException as e:
+                    if "already imported" not in str(e).lower():
+                        raise
+                    # it raced in after all; fall through to polling
+
+            if included_in is not None and not wait_for_finalization:
+                message_result = {"inBlock": included_in}
+            else:
+                block_info = await self._wait_for_extrinsic_inclusion_via_polling(
+                    extrinsic_hash, wait_for_finalization
                 )
-            )["rpc_request"]
+                key = "finalized" if wait_for_finalization else "inBlock"
+                message_result = {key: block_info["block_hash"]}
+            logger.info(
+                f"Recovered watched extrinsic {extrinsic_hash}: {message_result}"
+            )
+            await self.ws.inject_subscription_message(
+                old_subscription_id,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "author_extrinsicUpdate",
+                    "params": {
+                        "subscription": old_subscription_id,
+                        "result": message_result,
+                    },
+                },
+            )
+            return None
+
+        if wait_for_inclusion or wait_for_finalization:
+            try:
+                responses = (
+                    await self._make_rpc_request(
+                        [
+                            self.make_payload(
+                                "rpc_request",
+                                "author_submitAndWatchExtrinsic",
+                                [extrinsic_hex],
+                            )
+                        ],
+                        result_handler=result_handler,
+                        subscription_recoverer=subscription_recoverer,
+                    )
+                )["rpc_request"]
+            except SubstrateRequestException as e:
+                if "already imported" not in str(e).lower():
+                    raise
+                # The node already has this extrinsic even though the watch request errored — most
+                # likely a reconnection re-sent an in-flight submission. Watch it by polling instead.
+                responses = [
+                    await self._wait_for_extrinsic_inclusion_via_polling(
+                        extrinsic_hash, wait_for_finalization
+                    )
+                ]
             response = next(
                 (r for r in responses if "block_hash" in r and "extrinsic_hash" in r),
                 None,
@@ -4504,9 +4863,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             )
 
         else:
-            response = await self.rpc_request(
-                "author_submitExtrinsic", [str(extrinsic.data)]
-            )
+            response = await self.rpc_request("author_submitExtrinsic", [extrinsic_hex])
 
             result = AsyncExtrinsicReceipt(
                 substrate=self, extrinsic_hash=response["result"]
