@@ -647,6 +647,11 @@ class Websocket:
         self._max_retries = max_retries
         self._last_activity = asyncio.Event()
         self._last_activity.set()
+        # Set whenever a response, subscription message, or error is delivered;
+        # consumers arm (clear) it before scanning for results and wait on it
+        # instead of sleep-polling. Purely a wakeup optimization: correctness
+        # never depends on it, so waits use a short fallback timeout.
+        self._response_delivered = asyncio.Event()
         self._waiting_for_response = 0
         self._ssl_context = ssl_context
         if ssl_context is not None and ws_url.startswith("wss://"):
@@ -1173,6 +1178,7 @@ class Websocket:
             if self._received.get(response["id"]) is not None:
                 self._received[response["id"]].set_result(response)
             self._in_use_ids.discard(response["id"])
+            self._response_delivered.set()
         elif "params" in response:
             sub_id = response["params"]["subscription"]
             # a recovered subscription's messages arrive under its new server-side id, but its
@@ -1181,6 +1187,7 @@ class Websocket:
             if sub_id not in self._received_subscriptions:
                 self._received_subscriptions[sub_id] = asyncio.Queue()
             await self._received_subscriptions[sub_id].put(response)
+            self._response_delivered.set()
         else:
             raise KeyError(response)
 
@@ -1216,6 +1223,7 @@ class Websocket:
                     if not fut.done():
                         fut.set_exception(e)
                         fut.cancel()
+                self._response_delivered.set()
             else:
                 logger.debug("Timeout/ConnectionClosed occurred.")
             return e
@@ -1264,6 +1272,7 @@ class Websocket:
                     for i in self._received.keys():
                         self._received[i].set_exception(e)
                         self._received[i].cancel()
+                self._response_delivered.set()
             elif isinstance(e, websockets.exceptions.ConnectionClosedOK):
                 logger.debug("Websocket connection closed.")
             else:
@@ -1411,6 +1420,7 @@ class Websocket:
             )
             return
         await queue.put(message)
+        self._response_delivered.set()
 
     def _orphan_unrecoverable_subscriptions(self) -> list[str]:
         """
@@ -1432,6 +1442,7 @@ class Websocket:
             del self._received_subscriptions[sub_id]
             self._orphaned_subscriptions.add(sub_id)
         if orphaned:
+            self._response_delivered.set()
             logger.error(
                 f"Open subscriptions with no recovery handler cannot survive a reconnection "
                 f"and have been dropped: {orphaned}"
@@ -1499,6 +1510,30 @@ class Websocket:
             )
         finally:
             self._recovering_subscriptions.discard(subscription_id)
+
+    def arm_response_event(self) -> None:
+        """
+        Clear the response-delivered event, arming it for `wait_response_event`.
+
+        Call this *before* scanning for responses with `retrieve`: anything delivered
+        after arming re-sets the event, so a subsequent `wait_response_event` returns
+        immediately instead of missing the wakeup.
+        """
+        self._response_delivered.clear()
+
+    async def wait_response_event(self, timeout: float = 0.1) -> None:
+        """
+        Wait until a response, subscription message, or error has (possibly) been
+        delivered since the last `arm_response_event`, or until `timeout` elapses.
+
+        This is purely a wakeup optimization over sleep-polling: spurious wakeups are
+        fine (callers re-scan and re-arm), and the fallback timeout means a missed
+        `set()` on an exotic delivery path degrades to a slow poll rather than a hang.
+        """
+        try:
+            await asyncio.wait_for(self._response_delivered.wait(), timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            pass
 
     async def retrieve(self, item_id: str) -> Optional[dict]:
         """
@@ -3044,22 +3079,28 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         subscription_added = False
 
+        debug_logging = logger.isEnabledFor(logging.DEBUG)
+
         async with self.ws as ws:
             await ws.mark_waiting_for_response()
             try:
                 for payload in payloads:
                     item_id = await ws.send(payload["payload"])
                     request_manager.add_request(item_id, payload["id"])
-                    # truncate to 2000 chars for debug logging
-                    if len(stringified_payload := str(payload)) < 2_000:
-                        output_payload = stringified_payload
-                    else:
-                        output_payload = f"{stringified_payload[:2_000]} (truncated)"
-                    logger.debug(
-                        f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
-                    )
+                    if debug_logging:
+                        # truncate to 2000 chars for debug logging
+                        if len(stringified_payload := str(payload)) < 2_000:
+                            output_payload = stringified_payload
+                        else:
+                            output_payload = (
+                                f"{stringified_payload[:2_000]} (truncated)"
+                            )
+                        logger.debug(
+                            f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
+                        )
 
                 while True:
+                    ws.arm_response_event()
                     for item_id in request_manager.unresponded():
                         if (
                             item_id not in request_manager.responses
@@ -3111,26 +3152,29 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                 request_manager.add_response(
                                     item_id, decoded_response, complete
                                 )
-                                # truncate to 2000 chars for debug logging
-                                if (
-                                    len(stringified_response := str(decoded_response))
-                                    < 2_000
-                                ):
-                                    output_response = stringified_response
-                                    # avoids clogging logs up needlessly (esp for Metadata stuff)
-                                else:
-                                    output_response = (
-                                        f"{stringified_response[:2_000]} (truncated)"
+                                if debug_logging:
+                                    # truncate to 2000 chars for debug logging
+                                    if (
+                                        len(
+                                            stringified_response := str(
+                                                decoded_response
+                                            )
+                                        )
+                                        < 2_000
+                                    ):
+                                        output_response = stringified_response
+                                        # avoids clogging logs up needlessly (esp for Metadata stuff)
+                                    else:
+                                        output_response = f"{stringified_response[:2_000]} (truncated)"
+                                    logger.debug(
+                                        f"Received response for item ID {item_id}:\n{output_response}\n"
+                                        f"Complete: {complete}"
                                     )
-                                logger.debug(
-                                    f"Received response for item ID {item_id}:\n{output_response}\n"
-                                    f"Complete: {complete}"
-                                )
 
                     if request_manager.is_complete:
                         break
                     else:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in request_manager.unresponded():
@@ -4006,12 +4050,13 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 item_ids = await ws.send_batch(payloads)
                 pending = set(item_ids)
                 while pending:
+                    ws.arm_response_event()
                     for item_id in list(pending):
                         if (response := await ws.retrieve(item_id)) is not None:
                             responses[item_id] = response
                             pending.discard(item_id)
                     if pending:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in pending:
