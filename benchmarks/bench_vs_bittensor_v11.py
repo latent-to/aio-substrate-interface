@@ -135,7 +135,11 @@ async def e2e_pair(label, fn_asi, fn_v11, repeats, warmup=1, pause=0.2):
 
 def prefix_of(pallet: str, item: str, runtime) -> str:
     return StorageKey.create_from_storage_function(
-        pallet, item, [], runtime_config=runtime.runtime_config, metadata=runtime.metadata
+        pallet,
+        item,
+        [],
+        runtime_config=runtime.runtime_config,
+        metadata=runtime.metadata,
     ).data.hex()
 
 
@@ -157,9 +161,13 @@ async def main():
         async with AsyncSubstrateInterface(
             url=URL, ss58_format=42, chain_name="Bittensor"
         ) as asi:
-            block_hash = await asi.get_chain_finalised_head()
-            header = await asi.rpc_request("chain_getHeader", [block_hash])
-            block_number = int(header["result"]["number"], 16)
+            if pinned_bn := os.getenv("PINNED_BLOCK"):
+                block_number = int(pinned_bn)
+                block_hash = await asi.get_block_hash(block_number)
+            else:
+                block_hash = await asi.get_chain_finalised_head()
+                header = await asi.rpc_request("chain_getHeader", [block_hash])
+                block_number = int(header["result"]["number"], 16)
             print(f"pinned block {block_number} {block_hash}", flush=True)
 
             runtime = await asi.init_runtime(block_hash=block_hash)
@@ -359,7 +367,12 @@ async def main():
                 )
 
             await e2e_pair(
-                "query_batch 10k accounts", asi_e2e, v11_e2e, repeats=3, warmup=0, pause=0.5
+                "query_batch 10k accounts",
+                asi_e2e,
+                v11_e2e,
+                repeats=3,
+                warmup=0,
+                pause=0.5,
             )
 
             print(
@@ -367,7 +380,9 @@ async def main():
             )
             await e2e_pair(
                 "get_block",
-                lambda: asi.get_block(block_hash=block_hash, ignore_decoding_errors=True),
+                lambda: asi.get_block(
+                    block_hash=block_hash, ignore_decoding_errors=True
+                ),
                 lambda: client._substrate.get_block(block_hash=block_hash),
                 repeats=5,
                 pause=0,
@@ -434,7 +449,9 @@ async def main():
             async def asi_gather():
                 return await asyncio.gather(
                     *[
-                        asi.query("SubtensorModule", "Tempo", [n], block_hash=block_hash)
+                        asi.query(
+                            "SubtensorModule", "Tempo", [n], block_hash=block_hash
+                        )
                         for n in netuids
                     ]
                 )
