@@ -1890,7 +1890,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         if (
             isinstance(type_string, str)
             and isinstance(scale_bytes, (bytes, bytearray))
-            and runtime.config.get("strict_scale_decode")
+            # the strict flag lives on the interface config; Runtime.config
+            # only carries runtime-derived facts like is_weight_v2
+            and self.config.get("strict_scale_decode")
         ):
             # Value-decode fast path: plain values with no ScaleType objects.
             # It always enforces full-buffer consumption, so it is only used
