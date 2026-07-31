@@ -1724,10 +1724,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 )
 
                 if ss58_prefix_constant is not None:
-                    assert isinstance(ss58_prefix_constant.value, int)
-                    self.ss58_format = ss58_prefix_constant.value
-                    runtime.ss58_format = ss58_prefix_constant.value
-                    runtime.runtime_config.ss58_format = ss58_prefix_constant.value
+                    assert isinstance(ss58_prefix_constant, int)
+                    self.ss58_format = ss58_prefix_constant
+                    runtime.ss58_format = ss58_prefix_constant
+                    runtime.runtime_config.ss58_format = ss58_prefix_constant
         self.initialized = True
         self._initializing = False
 
@@ -1869,7 +1869,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         scale_bytes: bytes,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[Any]:
+    ) -> ScaleValue:
         """
         Helper function to decode arbitrary SCALE-bytes (e.g. 0x02000000) according to given type_string
         (e.g. BlockNumber). The relevant versioning information of the type (if defined) will be applied if block_hash
@@ -1883,12 +1883,22 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 loaded based on the block hash specified (or latest block if no block_hash is specified)
 
         Returns:
-            ScaleType object
+            the decoded value as a plain Python value (int/str/bool/dict/list/tuple/None)
         """
         if runtime is None:
             runtime = await self.init_runtime(block_hash=block_hash)
-        obj = scale_decode(type_string, scale_bytes, runtime=runtime)
-        return obj
+        if (
+            isinstance(type_string, str)
+            and isinstance(scale_bytes, (bytes, bytearray))
+            and runtime.config.get("strict_scale_decode")
+        ):
+            # Value-decode fast path: plain values with no ScaleType objects.
+            # It always enforces full-buffer consumption, so it is only used
+            # when strict decoding is on (the default).
+            value_fn = runtime.runtime_config.get_value_decoder(type_string)
+            if value_fn is not None:
+                return value_fn(scale_bytes)
+        return scale_decode(type_string, scale_bytes, runtime=runtime).value
 
     async def init_runtime(
         self,
@@ -2152,14 +2162,14 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                     # Decode SCALE result data
                     assert change_scale_type is not None
-                    updated_obj = await self.decode_scale(
+                    updated_value = await self.decode_scale(
                         type_string=change_scale_type,
                         scale_bytes=hex_to_bytes(change_data),
                         runtime=runtime,
                     )
 
                     subscription_result = await subscription_handler(
-                        storage_key, updated_obj.value, subscription_id
+                        storage_key, updated_value, subscription_id
                     )
 
                     if subscription_result is not None:
@@ -2438,7 +2448,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "authority_index"
                                         ]
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
 
@@ -2454,7 +2464,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                                         aura_predigest.decode(check_remaining=True)
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         rank_validator = aura_predigest.value[
                                             "slot_number"
                                         ] % len(validator_set)
@@ -2480,10 +2490,8 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "data"
                                         ]["authority_index"]
 
-                                        assert validator_set is not None
-                                        block_author = validator_set.elements[
-                                            rank_validator
-                                        ]
+                                        assert isinstance(validator_set, list)
+                                        block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
                                     else:
                                         raise NotImplementedError(
@@ -2793,7 +2801,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             block_hash=block_hash,
         )
         assert events is not None
-        return cast(list[dict], events.value)
+        return cast(list[dict], events)
 
     async def get_metadata(self, block_hash=None):
         """
@@ -3013,7 +3021,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Returns:
              (decoded response, completion)
         """
-        result: dict | ScaleType = response
+        result: dict | ScaleValue = response
         if value_scale_type and isinstance(storage_item, ScaleType):
             if (response_result := response.get("result")) is not None:
                 query_value = response_result
@@ -3820,19 +3828,16 @@ class AsyncSubstrateInterface(SubstrateMixin):
         if "error" in result_data:
             raise SubstrateRequestException(result_data["error"]["message"])
         result_vec_u8_bytes = hex_to_bytes(result_data["result"])
-        _decoded = await self.decode_scale(
+        result_bytes = await self.decode_scale(
             "Vec<u8>", result_vec_u8_bytes, runtime=runtime
         )
-        result_bytes = _decoded.value
-
-        # TODO check to see if we can use the bytes from the ScaleType rather than using the value
-        # TODO and then re-encoding as bytes
 
         # Decode result
         # Get correct type
         if isinstance(result_bytes, str):
             raw_bytes = hex_to_bytes(result_bytes)
         else:
+            assert isinstance(result_bytes, (bytes, bytearray, list))
             raw_bytes = bytes(result_bytes)
         result = runtime_call_def["decoder"](raw_bytes, runtime)
         return result
@@ -3917,8 +3922,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         # Decode result
         result_bytes = hex_to_bytes(result_data["result"])
-        obj = await self.decode_scale(output_type_string, result_bytes, runtime=runtime)
-        return obj.value
+        return await self.decode_scale(
+            output_type_string, result_bytes, runtime=runtime
+        )
 
     async def runtime_calls(
         self,
@@ -4070,10 +4076,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 raise SubstrateRequestException(result_data["error"]["message"])
             output_type_string = f"scale_info::{runtime_call_def['output']}"
             result_bytes = hex_to_bytes(result_data["result"])
-            obj = await self.decode_scale(
-                output_type_string, result_bytes, runtime=runtime
+            results.append(
+                await self.decode_scale(
+                    output_type_string, result_bytes, runtime=runtime
+                )
             )
-            results.append(obj.value)
         return results
 
     async def get_account_nonce(self, account_address: str) -> int:
@@ -4096,7 +4103,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             response = await self.query(
                 module="System", storage_function="Account", params=[account_address]
             )
-            assert response is not None
+            assert isinstance(response, dict)
             return response["nonce"]
 
     def clear_nonce_cache_for_account(self, account_address: str) -> None:
@@ -4190,9 +4197,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         constant_name: str,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> Optional[ScaleType[ScaleValue]]:
+    ) -> Optional[ScaleValue]:
         """
-        Returns the decoded `ScaleType` object of the constant for given module name, call function name and block_hash
+        Returns the decoded value of the constant for given module name, call function name and block_hash
         (or chaintip if block_hash is omitted)
 
         Args:
@@ -4202,13 +4209,12 @@ class AsyncSubstrateInterface(SubstrateMixin):
             runtime: Runtime to use for querying the constant
 
         Returns:
-             ScaleType from the runtime call
+             the decoded constant as a plain Python value, or None when the constant does not exist
         """
         constant = await self.get_metadata_constant(
             module_name, constant_name, block_hash=block_hash, runtime=runtime
         )
         if constant:
-            # Decode to ScaleType
             return await self.decode_scale(
                 constant.type,
                 bytes(constant.constant_value),
@@ -4375,10 +4381,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
         raw_storage_key: Optional[bytes] = None,
         subscription_handler=None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[ScaleValue]:
+    ) -> ScaleValue:
         """
-        Queries substrate. This should only be used when making a single request. For multiple requests,
-        you should use `self.query_multi`
+        Queries substrate, returning the decoded storage value as a plain Python value
+        (int/str/bool/dict/list/tuple/None). This should only be used when making a single request.
+        For multiple requests, you should use `self.query_multi`
         """
         if block_hash:
             self.last_block_hash = block_hash
@@ -4631,11 +4638,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
             max_weight = payment_info["weight"]
 
         # Check if call has existing approvals
-        multisig_details_ = await self.query(
+        multisig_details = await self.query(
             "Multisig", "Multisigs", [multisig_account.value, call.call_hash]
         )
-        multisig_details = multisig_details_.value
-        assert isinstance(multisig_details, dict)
+        assert multisig_details is None or isinstance(multisig_details, dict)
         if multisig_details:
             maybe_timepoint = multisig_details["when"]
         else:
