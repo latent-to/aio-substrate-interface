@@ -45,10 +45,8 @@ async def test_runtime_call(monkeypatch):
     # Patch encode_scale (should not be called in this test since no inputs)
     substrate.encode_scale = AsyncMock()
 
-    # Patch decode_scale to produce a dummy value
-    mock_scale_obj = MagicMock()
-    mock_scale_obj.value = "decoded_result"
-    substrate.decode_scale = AsyncMock(return_value=mock_scale_obj)
+    # Patch decode_scale to produce a dummy value (returns plain values)
+    substrate.decode_scale = AsyncMock(return_value="decoded_result")
 
     # Patch RPC request with correct behavior
     substrate.rpc_request = AsyncMock(
@@ -106,9 +104,8 @@ async def test_runtime_calls():
     # Each input encodes to a single byte 0xab → hex "ab".
     substrate.encode_scale = AsyncMock(return_value=b"\xab")
 
-    decoded_1, decoded_2 = MagicMock(), MagicMock()
-    decoded_1.value, decoded_2.value = "result_1", "result_2"
-    substrate.decode_scale = AsyncMock(side_effect=[decoded_1, decoded_2])
+    # decode_scale returns plain values
+    substrate.decode_scale = AsyncMock(side_effect=["result_1", "result_2"])
 
     # Mock the websocket: send_batch hands back ids, retrieve resolves each by id.
     ws_responses = {"id0": {"result": "0x00"}, "id1": {"result": "0x01"}}

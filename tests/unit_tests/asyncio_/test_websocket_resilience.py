@@ -79,6 +79,12 @@ class _FakePoisonWs:
         self._sent += 1
         return item_id
 
+    def arm_response_event(self):
+        pass
+
+    async def wait_response_event(self, timeout: float = 0.1):
+        pass
+
     async def retrieve(self, item_id):
         raise TimeoutError("Max retries exceeded.")
 

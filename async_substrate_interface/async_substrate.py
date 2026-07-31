@@ -647,6 +647,11 @@ class Websocket:
         self._max_retries = max_retries
         self._last_activity = asyncio.Event()
         self._last_activity.set()
+        # Set whenever a response, subscription message, or error is delivered;
+        # consumers arm (clear) it before scanning for results and wait on it
+        # instead of sleep-polling. Purely a wakeup optimization: correctness
+        # never depends on it, so waits use a short fallback timeout.
+        self._response_delivered = asyncio.Event()
         self._waiting_for_response = 0
         self._ssl_context = ssl_context
         if ssl_context is not None and ws_url.startswith("wss://"):
@@ -1173,6 +1178,7 @@ class Websocket:
             if self._received.get(response["id"]) is not None:
                 self._received[response["id"]].set_result(response)
             self._in_use_ids.discard(response["id"])
+            self._response_delivered.set()
         elif "params" in response:
             sub_id = response["params"]["subscription"]
             # a recovered subscription's messages arrive under its new server-side id, but its
@@ -1181,6 +1187,7 @@ class Websocket:
             if sub_id not in self._received_subscriptions:
                 self._received_subscriptions[sub_id] = asyncio.Queue()
             await self._received_subscriptions[sub_id].put(response)
+            self._response_delivered.set()
         else:
             raise KeyError(response)
 
@@ -1216,6 +1223,7 @@ class Websocket:
                     if not fut.done():
                         fut.set_exception(e)
                         fut.cancel()
+                self._response_delivered.set()
             else:
                 logger.debug("Timeout/ConnectionClosed occurred.")
             return e
@@ -1264,6 +1272,7 @@ class Websocket:
                     for i in self._received.keys():
                         self._received[i].set_exception(e)
                         self._received[i].cancel()
+                self._response_delivered.set()
             elif isinstance(e, websockets.exceptions.ConnectionClosedOK):
                 logger.debug("Websocket connection closed.")
             else:
@@ -1411,6 +1420,7 @@ class Websocket:
             )
             return
         await queue.put(message)
+        self._response_delivered.set()
 
     def _orphan_unrecoverable_subscriptions(self) -> list[str]:
         """
@@ -1432,6 +1442,7 @@ class Websocket:
             del self._received_subscriptions[sub_id]
             self._orphaned_subscriptions.add(sub_id)
         if orphaned:
+            self._response_delivered.set()
             logger.error(
                 f"Open subscriptions with no recovery handler cannot survive a reconnection "
                 f"and have been dropped: {orphaned}"
@@ -1499,6 +1510,30 @@ class Websocket:
             )
         finally:
             self._recovering_subscriptions.discard(subscription_id)
+
+    def arm_response_event(self) -> None:
+        """
+        Clear the response-delivered event, arming it for `wait_response_event`.
+
+        Call this *before* scanning for responses with `retrieve`: anything delivered
+        after arming re-sets the event, so a subsequent `wait_response_event` returns
+        immediately instead of missing the wakeup.
+        """
+        self._response_delivered.clear()
+
+    async def wait_response_event(self, timeout: float = 0.1) -> None:
+        """
+        Wait until a response, subscription message, or error has (possibly) been
+        delivered since the last `arm_response_event`, or until `timeout` elapses.
+
+        This is purely a wakeup optimization over sleep-polling: spurious wakeups are
+        fine (callers re-scan and re-arm), and the fallback timeout means a missed
+        `set()` on an exotic delivery path degrades to a slow poll rather than a hang.
+        """
+        try:
+            await asyncio.wait_for(self._response_delivered.wait(), timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            pass
 
     async def retrieve(self, item_id: str) -> Optional[dict]:
         """
@@ -1689,10 +1724,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 )
 
                 if ss58_prefix_constant is not None:
-                    assert isinstance(ss58_prefix_constant.value, int)
-                    self.ss58_format = ss58_prefix_constant.value
-                    runtime.ss58_format = ss58_prefix_constant.value
-                    runtime.runtime_config.ss58_format = ss58_prefix_constant.value
+                    assert isinstance(ss58_prefix_constant, int)
+                    self.ss58_format = ss58_prefix_constant
+                    runtime.ss58_format = ss58_prefix_constant
+                    runtime.runtime_config.ss58_format = ss58_prefix_constant
         self.initialized = True
         self._initializing = False
 
@@ -1834,7 +1869,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         scale_bytes: bytes,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[Any]:
+    ) -> ScaleValue:
         """
         Helper function to decode arbitrary SCALE-bytes (e.g. 0x02000000) according to given type_string
         (e.g. BlockNumber). The relevant versioning information of the type (if defined) will be applied if block_hash
@@ -1848,12 +1883,24 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 loaded based on the block hash specified (or latest block if no block_hash is specified)
 
         Returns:
-            ScaleType object
+            the decoded value as a plain Python value (int/str/bool/dict/list/tuple/None)
         """
         if runtime is None:
             runtime = await self.init_runtime(block_hash=block_hash)
-        obj = scale_decode(type_string, scale_bytes, runtime=runtime)
-        return obj
+        if (
+            isinstance(type_string, str)
+            and isinstance(scale_bytes, (bytes, bytearray))
+            # the strict flag lives on the interface config; Runtime.config
+            # only carries runtime-derived facts like is_weight_v2
+            and self.config.get("strict_scale_decode")
+        ):
+            # Value-decode fast path: plain values with no ScaleType objects.
+            # It always enforces full-buffer consumption, so it is only used
+            # when strict decoding is on (the default).
+            value_fn = runtime.runtime_config.get_value_decoder(type_string)
+            if value_fn is not None:
+                return value_fn(scale_bytes)
+        return scale_decode(type_string, scale_bytes, runtime=runtime).value
 
     async def init_runtime(
         self,
@@ -2117,14 +2164,14 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                     # Decode SCALE result data
                     assert change_scale_type is not None
-                    updated_obj = await self.decode_scale(
+                    updated_value = await self.decode_scale(
                         type_string=change_scale_type,
                         scale_bytes=hex_to_bytes(change_data),
                         runtime=runtime,
                     )
 
                     subscription_result = await subscription_handler(
-                        storage_key, updated_obj.value, subscription_id
+                        storage_key, updated_value, subscription_id
                     )
 
                     if subscription_result is not None:
@@ -2403,7 +2450,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "authority_index"
                                         ]
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
 
@@ -2419,7 +2466,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                                         aura_predigest.decode(check_remaining=True)
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         rank_validator = aura_predigest.value[
                                             "slot_number"
                                         ] % len(validator_set)
@@ -2445,10 +2492,8 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "data"
                                         ]["authority_index"]
 
-                                        assert validator_set is not None
-                                        block_author = validator_set.elements[
-                                            rank_validator
-                                        ]
+                                        assert isinstance(validator_set, list)
+                                        block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
                                     else:
                                         raise NotImplementedError(
@@ -2758,7 +2803,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             block_hash=block_hash,
         )
         assert events is not None
-        return cast(list[dict], events.value)
+        return cast(list[dict], events)
 
     async def get_metadata(self, block_hash=None):
         """
@@ -2898,25 +2943,22 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Creates a Preprocessed data object for passing to `_make_rpc_request`
         """
         params = query_for if query_for else []
-        # Search storage call in metadata
+        # Search storage call in metadata (resolved once per storage function
+        # and cached on the metadata object; see StorageKey.prepared)
         if runtime is None:
             runtime = self.runtime
         assert runtime is not None
-        metadata_pallet = runtime.metadata.get_metadata_pallet(module)
-
-        if not metadata_pallet:
-            raise SubstrateRequestException(f'Pallet "{module}" not found')
-
-        storage_item = metadata_pallet.get_storage_function(storage_function)
-
-        if not metadata_pallet or not storage_item:
-            raise StorageFunctionNotFound(
-                f'Storage function "{module}.{storage_function}" not found'
+        try:
+            storage_item, value_scale_type, param_types, *_ = StorageKey.prepared(
+                module,
+                storage_function,
+                runtime_config=runtime.runtime_config,
+                metadata=runtime.metadata,
             )
-
-        # SCALE type string of value
-        param_types = storage_item.get_params_type_string()
-        value_scale_type = storage_item.get_value_type_string()
+        except StorageFunctionNotFound as e:
+            if "Pallet" in str(e):
+                raise SubstrateRequestException(str(e))
+            raise
 
         if len(params) != len(param_types):
             raise ValueError(
@@ -2978,7 +3020,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Returns:
              (decoded response, completion)
         """
-        result: dict | ScaleType = response
+        result: dict | ScaleValue = response
         if value_scale_type and isinstance(storage_item, ScaleType):
             if (response_result := response.get("result")) is not None:
                 query_value = response_result
@@ -3044,22 +3086,28 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         subscription_added = False
 
+        debug_logging = logger.isEnabledFor(logging.DEBUG)
+
         async with self.ws as ws:
             await ws.mark_waiting_for_response()
             try:
                 for payload in payloads:
                     item_id = await ws.send(payload["payload"])
                     request_manager.add_request(item_id, payload["id"])
-                    # truncate to 2000 chars for debug logging
-                    if len(stringified_payload := str(payload)) < 2_000:
-                        output_payload = stringified_payload
-                    else:
-                        output_payload = f"{stringified_payload[:2_000]} (truncated)"
-                    logger.debug(
-                        f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
-                    )
+                    if debug_logging:
+                        # truncate to 2000 chars for debug logging
+                        if len(stringified_payload := str(payload)) < 2_000:
+                            output_payload = stringified_payload
+                        else:
+                            output_payload = (
+                                f"{stringified_payload[:2_000]} (truncated)"
+                            )
+                        logger.debug(
+                            f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
+                        )
 
                 while True:
+                    ws.arm_response_event()
                     for item_id in request_manager.unresponded():
                         if (
                             item_id not in request_manager.responses
@@ -3111,26 +3159,29 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                 request_manager.add_response(
                                     item_id, decoded_response, complete
                                 )
-                                # truncate to 2000 chars for debug logging
-                                if (
-                                    len(stringified_response := str(decoded_response))
-                                    < 2_000
-                                ):
-                                    output_response = stringified_response
-                                    # avoids clogging logs up needlessly (esp for Metadata stuff)
-                                else:
-                                    output_response = (
-                                        f"{stringified_response[:2_000]} (truncated)"
+                                if debug_logging:
+                                    # truncate to 2000 chars for debug logging
+                                    if (
+                                        len(
+                                            stringified_response := str(
+                                                decoded_response
+                                            )
+                                        )
+                                        < 2_000
+                                    ):
+                                        output_response = stringified_response
+                                        # avoids clogging logs up needlessly (esp for Metadata stuff)
+                                    else:
+                                        output_response = f"{stringified_response[:2_000]} (truncated)"
+                                    logger.debug(
+                                        f"Received response for item ID {item_id}:\n{output_response}\n"
+                                        f"Complete: {complete}"
                                     )
-                                logger.debug(
-                                    f"Received response for item ID {item_id}:\n{output_response}\n"
-                                    f"Complete: {complete}"
-                                )
 
                     if request_manager.is_complete:
                         break
                     else:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in request_manager.unresponded():
@@ -3776,19 +3827,16 @@ class AsyncSubstrateInterface(SubstrateMixin):
         if "error" in result_data:
             raise SubstrateRequestException(result_data["error"]["message"])
         result_vec_u8_bytes = hex_to_bytes(result_data["result"])
-        _decoded = await self.decode_scale(
+        result_bytes = await self.decode_scale(
             "Vec<u8>", result_vec_u8_bytes, runtime=runtime
         )
-        result_bytes = _decoded.value
-
-        # TODO check to see if we can use the bytes from the ScaleType rather than using the value
-        # TODO and then re-encoding as bytes
 
         # Decode result
         # Get correct type
         if isinstance(result_bytes, str):
             raw_bytes = hex_to_bytes(result_bytes)
         else:
+            assert isinstance(result_bytes, (bytes, bytearray, list))
             raw_bytes = bytes(result_bytes)
         result = runtime_call_def["decoder"](raw_bytes, runtime)
         return result
@@ -3873,8 +3921,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         # Decode result
         result_bytes = hex_to_bytes(result_data["result"])
-        obj = await self.decode_scale(output_type_string, result_bytes, runtime=runtime)
-        return obj.value
+        return await self.decode_scale(
+            output_type_string, result_bytes, runtime=runtime
+        )
 
     async def runtime_calls(
         self,
@@ -4006,12 +4055,13 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 item_ids = await ws.send_batch(payloads)
                 pending = set(item_ids)
                 while pending:
+                    ws.arm_response_event()
                     for item_id in list(pending):
                         if (response := await ws.retrieve(item_id)) is not None:
                             responses[item_id] = response
                             pending.discard(item_id)
                     if pending:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in pending:
@@ -4025,10 +4075,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 raise SubstrateRequestException(result_data["error"]["message"])
             output_type_string = f"scale_info::{runtime_call_def['output']}"
             result_bytes = hex_to_bytes(result_data["result"])
-            obj = await self.decode_scale(
-                output_type_string, result_bytes, runtime=runtime
+            results.append(
+                await self.decode_scale(
+                    output_type_string, result_bytes, runtime=runtime
+                )
             )
-            results.append(obj.value)
         return results
 
     async def get_account_nonce(self, account_address: str) -> int:
@@ -4051,7 +4102,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             response = await self.query(
                 module="System", storage_function="Account", params=[account_address]
             )
-            assert response is not None
+            assert isinstance(response, dict)
             return response["nonce"]
 
     def clear_nonce_cache_for_account(self, account_address: str) -> None:
@@ -4145,9 +4196,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         constant_name: str,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> Optional[ScaleType[ScaleValue]]:
+    ) -> Optional[ScaleValue]:
         """
-        Returns the decoded `ScaleType` object of the constant for given module name, call function name and block_hash
+        Returns the decoded value of the constant for given module name, call function name and block_hash
         (or chaintip if block_hash is omitted)
 
         Args:
@@ -4157,13 +4208,12 @@ class AsyncSubstrateInterface(SubstrateMixin):
             runtime: Runtime to use for querying the constant
 
         Returns:
-             ScaleType from the runtime call
+             the decoded constant as a plain Python value, or None when the constant does not exist
         """
         constant = await self.get_metadata_constant(
             module_name, constant_name, block_hash=block_hash, runtime=runtime
         )
         if constant:
-            # Decode to ScaleType
             return await self.decode_scale(
                 constant.type,
                 bytes(constant.constant_value),
@@ -4330,10 +4380,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
         raw_storage_key: Optional[bytes] = None,
         subscription_handler=None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[ScaleValue]:
+    ) -> ScaleValue:
         """
-        Queries substrate. This should only be used when making a single request. For multiple requests,
-        you should use `self.query_multi`
+        Queries substrate, returning the decoded storage value as a plain Python value
+        (int/str/bool/dict/list/tuple/None). This should only be used when making a single request.
+        For multiple requests, you should use `self.query_multi`
         """
         if block_hash:
             self.last_block_hash = block_hash
@@ -4586,11 +4637,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
             max_weight = payment_info["weight"]
 
         # Check if call has existing approvals
-        multisig_details_ = await self.query(
+        multisig_details = await self.query(
             "Multisig", "Multisigs", [multisig_account.value, call.call_hash]
         )
-        multisig_details = multisig_details_.value
-        assert isinstance(multisig_details, dict)
+        assert multisig_details is None or isinstance(multisig_details, dict)
         if multisig_details:
             maybe_timepoint = multisig_details["when"]
         else:
