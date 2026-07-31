@@ -27,6 +27,9 @@ from async_substrate_interface.utils.decoding import try_batch_decode, decode_qu
 from bittensor._transport.storage import decode_storage_values, decode_map_pairs
 
 URL = os.getenv("RPC_ENDPOINT", "wss://archive.sub.latent.to")
+# The full query_map scenario costs v11 two RPCs per 100 entries (~3min for a
+# 30k-entry map over WAN; seconds against a local node). Disable with FULL_MAPS=0.
+FULL_MAPS = os.getenv("FULL_MAPS", "1") == "1"
 N_ACCOUNTS = 10_000
 REPEATS = 5
 SCRATCH = "/tmp"
@@ -99,6 +102,41 @@ def bench_pair(label: str, fn_asi, fn_v11, repeats: int = REPEATS, warmup: int =
     print(f"  {label:<40} asi/v11 = {ratio:.2f}x", flush=True)
     results_table.append((label, out["asi"][0], out["v11"][0]))
     return out["asi"][2], out["v11"][2]
+
+
+e2e_table: list[tuple[str, float, float]] = []
+
+
+async def e2e_pair(label, fn_asi, fn_v11, repeats, warmup=1, pause=0.2):
+    """Time two async callables end-to-end (network included), asi first."""
+    out = {}
+    for name, fn in (("asi", fn_asi), ("v11", fn_v11)):
+        for _ in range(warmup):
+            await fn()
+        times = []
+        last = None
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            last = await fn()
+            times.append(time.perf_counter() - t0)
+            if pause:
+                await asyncio.sleep(pause)
+        out[name] = (statistics.median(times), min(times), last)
+        print(
+            f"  {label:<40} {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
+            f"min={min(times) * 1000:9.1f}ms",
+            flush=True,
+        )
+    ratio = out["asi"][0] / out["v11"][0] if out["v11"][0] else float("inf")
+    print(f"  {label:<40} asi/v11 = {ratio:.2f}x", flush=True)
+    e2e_table.append((label, out["asi"][0], out["v11"][0]))
+    return out["asi"][2], out["v11"][2]
+
+
+def prefix_of(pallet: str, item: str, runtime) -> str:
+    return StorageKey.create_from_storage_function(
+        pallet, item, [], runtime_config=runtime.runtime_config, metadata=runtime.metadata
+    ).data.hex()
 
 
 async def rpc_chunked_query_storage_at(asi, hex_keys, block_hash, chunk=2500):
@@ -320,39 +358,186 @@ async def main():
                     "System", "Account", params, block_hash=block_hash
                 )
 
-            for name, fn in (("asi", asi_e2e), ("v11", v11_e2e)):
-                times = []
-                for _ in range(3):
-                    t0 = time.perf_counter()
-                    r = await fn()
-                    times.append(time.perf_counter() - t0)
-                    await asyncio.sleep(0.5)
-                print(
-                    f"  e2e query_batch 10k  {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
-                    f"min={min(times) * 1000:9.1f}ms  n={len(r)}",
-                    flush=True,
-                )
+            await e2e_pair(
+                "query_batch 10k accounts", asi_e2e, v11_e2e, repeats=3, warmup=0, pause=0.5
+            )
 
             print(
                 "\n== Phase 6: end-to-end get_block (network, 5 repeats) ==", flush=True
             )
-            for name, fn in (
-                (
-                    "asi",
-                    lambda: asi.get_block(
-                        block_hash=block_hash, ignore_decoding_errors=True
-                    ),
+            await e2e_pair(
+                "get_block",
+                lambda: asi.get_block(block_hash=block_hash, ignore_decoding_errors=True),
+                lambda: client._substrate.get_block(block_hash=block_hash),
+                repeats=5,
+                pause=0,
+            )
+
+            # ---------------- Phase 7: end-to-end real-world scenarios ----------------
+            print(
+                "\n== Phase 7: end-to-end real-world scenarios (network) ==", flush=True
+            )
+
+            # a real existing account: trailing 32 bytes of the first System.Account key
+            acct_keys = await asi.rpc_request(
+                "state_getKeysPaged",
+                [
+                    "0x" + prefix_of("System", "Account", runtime),
+                    1,
+                    "0x" + prefix_of("System", "Account", runtime),
+                    block_hash,
+                ],
+            )
+            real_account = "0x" + acct_keys["result"][0][-64:]
+
+            # single storage read: the most common call in any bot/validator loop
+            a_val, v_val = await e2e_pair(
+                "single query (System.Account)",
+                lambda: asi.query(
+                    "System", "Account", [real_account], block_hash=block_hash
                 ),
-                ("v11", lambda: client._substrate.get_block(block_hash=block_hash)),
-            ):
-                times = []
-                for _ in range(5):
-                    t0 = time.perf_counter()
-                    r = await fn()
-                    times.append(time.perf_counter() - t0)
+                lambda: client._substrate.query(
+                    "System", "Account", [real_account], block_hash
+                ),
+                repeats=10,
+                pause=0,
+            )
+            print(
+                f"  single-query results identical: {digest(a_val) == digest(v_val)}",
+                flush=True,
+            )
+
+            # sequential burst: 30 dependent reads (e.g. iterating subnets)
+            netuids = list(range(30))
+
+            async def asi_seq():
+                return [
+                    await asi.query(
+                        "SubtensorModule", "Tempo", [n], block_hash=block_hash
+                    )
+                    for n in netuids
+                ]
+
+            async def v11_seq():
+                return [
+                    await client._substrate.query(
+                        "SubtensorModule", "Tempo", [n], block_hash
+                    )
+                    for n in netuids
+                ]
+
+            await e2e_pair(
+                "30 sequential queries (Tempo)", asi_seq, v11_seq, repeats=3, pause=0
+            )
+
+            # concurrent burst: same 30 reads via gather (websocket multiplexing)
+            async def asi_gather():
+                return await asyncio.gather(
+                    *[
+                        asi.query("SubtensorModule", "Tempo", [n], block_hash=block_hash)
+                        for n in netuids
+                    ]
+                )
+
+            async def v11_gather():
+                return await asyncio.gather(
+                    *[
+                        client._substrate.query(
+                            "SubtensorModule", "Tempo", [n], block_hash
+                        )
+                        for n in netuids
+                    ]
+                )
+
+            await e2e_pair(
+                "30 concurrent queries (gather)",
+                asi_gather,
+                v11_gather,
+                repeats=3,
+                pause=0,
+            )
+
+            # runtime API call
+            await e2e_pair(
+                "runtime_call (current_alpha_price)",
+                lambda: asi.runtime_call(
+                    "SwapRuntimeApi", "current_alpha_price", [1], block_hash=block_hash
+                ),
+                lambda: client._substrate.runtime_call(
+                    "SwapRuntimeApi", "current_alpha_price", [1], block_hash
+                ),
+                repeats=10,
+                pause=0,
+            )
+
+            # events of a block (fetch + decode Vec<EventRecord>)
+            await e2e_pair(
+                "get_events",
+                lambda: asi.get_events(block_hash=block_hash),
+                lambda: client._substrate.events(block_hash),
+                repeats=5,
+                pause=0,
+            )
+
+            # one subnet's Keys map, page size matched at 100 for both
+            async def asi_map_subnet():
+                qm = await asi.query_map(
+                    "SubtensorModule",
+                    "Keys",
+                    params=[1],
+                    block_hash=block_hash,
+                    page_size=100,
+                )
+                return [kv async for kv in qm]
+
+            async def v11_map_subnet():
+                return await client._substrate.query_map(
+                    "SubtensorModule", "Keys", [1], block_hash
+                )
+
+            await e2e_pair(
+                "query_map one subnet (Keys, page=100)",
+                asi_map_subnet,
+                v11_map_subnet,
+                repeats=3,
+                pause=0,
+            )
+
+            if FULL_MAPS:
+                # the metagraph-style scan: each library in its idiomatic fast
+                # mode (asi: fully_exhaust; v11: its built-in 100-entry pages),
+                # so this measures the workflow, not a matched RPC pattern
+                async def asi_map_full():
+                    qm = await asi.query_map(
+                        "SubtensorModule",
+                        "Keys",
+                        block_hash=block_hash,
+                        page_size=1000,
+                        fully_exhaust=True,
+                    )
+                    return [kv async for kv in qm]
+
+                async def v11_map_full():
+                    return await client._substrate.query_map(
+                        "SubtensorModule", "Keys", None, block_hash
+                    )
+
+                a_full, v_full = await e2e_pair(
+                    "query_map full (Keys, idiomatic modes)",
+                    asi_map_full,
+                    v11_map_full,
+                    repeats=1,
+                    warmup=0,
+                    pause=0,
+                )
                 print(
-                    f"  e2e get_block        {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
-                    f"min={min(times) * 1000:9.1f}ms",
+                    f"  full-map sizes: asi={len(a_full)} v11={len(v_full)}", flush=True
+                )
+
+            print("\n==== E2E summary (median, asi vs v11) ====", flush=True)
+            for label, a, v in e2e_table:
+                print(
+                    f"  {label:<40} asi={a * 1000:9.1f}ms  v11={v * 1000:9.1f}ms  ratio={a / v if v else float('inf'):.2f}x",
                     flush=True,
                 )
 
