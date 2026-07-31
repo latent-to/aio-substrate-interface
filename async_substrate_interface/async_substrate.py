@@ -2943,25 +2943,22 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Creates a Preprocessed data object for passing to `_make_rpc_request`
         """
         params = query_for if query_for else []
-        # Search storage call in metadata
+        # Search storage call in metadata (resolved once per storage function
+        # and cached on the metadata object; see StorageKey.prepared)
         if runtime is None:
             runtime = self.runtime
         assert runtime is not None
-        metadata_pallet = runtime.metadata.get_metadata_pallet(module)
-
-        if not metadata_pallet:
-            raise SubstrateRequestException(f'Pallet "{module}" not found')
-
-        storage_item = metadata_pallet.get_storage_function(storage_function)
-
-        if not metadata_pallet or not storage_item:
-            raise StorageFunctionNotFound(
-                f'Storage function "{module}.{storage_function}" not found'
+        try:
+            storage_item, value_scale_type, param_types, *_ = StorageKey.prepared(
+                module,
+                storage_function,
+                runtime_config=runtime.runtime_config,
+                metadata=runtime.metadata,
             )
-
-        # SCALE type string of value
-        param_types = storage_item.get_params_type_string()
-        value_scale_type = storage_item.get_value_type_string()
+        except StorageFunctionNotFound as e:
+            if "Pallet" in str(e):
+                raise SubstrateRequestException(str(e))
+            raise
 
         if len(params) != len(param_types):
             raise ValueError(
