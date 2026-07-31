@@ -11,11 +11,12 @@ Fixes the problems in ~/Downloads/test.ipynb:
 
 import asyncio
 import json
+import os
 import pickle
 import statistics
 import time
 from hashlib import blake2b
-from typing import Any, Optional
+from typing import Any
 
 import bittensor as bt
 from scalecodec import ScaleBytes
@@ -23,13 +24,12 @@ from scalecodec import ScaleBytes
 from async_substrate_interface.async_substrate import AsyncSubstrateInterface
 from async_substrate_interface.utils.storage import StorageKey
 from async_substrate_interface.utils.decoding import try_batch_decode, decode_query_map
-from async_substrate_interface.utils import hex_to_bytes
 from bittensor._transport.storage import decode_storage_values, decode_map_pairs
 
-URL = "wss://archive.sub.latent.to"
+URL = os.getenv("RPC_ENDPOINT", "wss://archive.sub.latent.to")
 N_ACCOUNTS = 10_000
 REPEATS = 5
-SCRATCH = "/private/tmp/claude-501/-Users-benjaminhimes-Git-async-substrate-interface/9d341452-7636-4bdf-9254-9967584103fe/scratchpad"
+SCRATCH = "/tmp"
 
 BASE_ACCOUNT_HEX = "d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"
 
@@ -58,7 +58,10 @@ def canonical(x: Any) -> Any:
     if isinstance(x, bytes):
         return "0x" + x.hex()
     if isinstance(x, dict):
-        return {str(k): canonical(v) for k, v in sorted(x.items(), key=lambda kv: str(kv[0]))}
+        return {
+            str(k): canonical(v)
+            for k, v in sorted(x.items(), key=lambda kv: str(kv[0]))
+        }
     if isinstance(x, (tuple, list)):
         return [canonical(v) for v in x]
     return x
@@ -66,7 +69,9 @@ def canonical(x: Any) -> Any:
 
 def digest(x: Any) -> str:
     return blake2b(
-        json.dumps(canonical(x), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(),
+        json.dumps(
+            canonical(x), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode(),
         digest_size=16,
     ).hexdigest()
 
@@ -86,8 +91,8 @@ def bench_pair(label: str, fn_asi, fn_v11, repeats: int = REPEATS, warmup: int =
             times.append(time.perf_counter() - t0)
         out[name] = (statistics.median(times), min(times), last)
         print(
-            f"  {label:<40} {name:<4} median={statistics.median(times)*1000:9.1f}ms  "
-            f"min={min(times)*1000:9.1f}ms",
+            f"  {label:<40} {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
+            f"min={min(times) * 1000:9.1f}ms",
             flush=True,
         )
     ratio = out["asi"][0] / out["v11"][0] if out["v11"][0] else float("inf")
@@ -111,7 +116,9 @@ async def rpc_chunked_query_storage_at(asi, hex_keys, block_hash, chunk=2500):
 async def main():
     print(f"connecting to {URL}", flush=True)
     async with bt.Subtensor(URL, fallback_endpoints=[], archive_endpoints=[]) as client:
-        async with AsyncSubstrateInterface(url=URL, ss58_format=42, chain_name="Bittensor") as asi:
+        async with AsyncSubstrateInterface(
+            url=URL, ss58_format=42, chain_name="Bittensor"
+        ) as asi:
             block_hash = await asi.get_chain_finalised_head()
             header = await asi.rpc_request("chain_getHeader", [block_hash])
             block_number = int(header["result"]["number"], 16)
@@ -125,18 +132,26 @@ async def main():
             params = account_params(N_ACCOUNTS)
 
             # ---------------- Phase 1: key building (CPU) ----------------
-            print("\n== Phase 1: build 10k System.Account storage keys (CPU) ==", flush=True)
+            print(
+                "\n== Phase 1: build 10k System.Account storage keys (CPU) ==",
+                flush=True,
+            )
 
             def asi_keys_batch():
                 return StorageKey.create_from_storage_function_batch(
-                    "System", "Account", params,
-                    runtime_config=runtime.runtime_config, metadata=runtime.metadata,
+                    "System",
+                    "Account",
+                    params,
+                    runtime_config=runtime.runtime_config,
+                    metadata=runtime.metadata,
                 )
 
             def v11_keys():
                 return codec.storage_key_batch(entry, params)
 
-            asi_keys, v11_key_bytes = bench_pair("keybuild 10k", asi_keys_batch, v11_keys)
+            asi_keys, v11_key_bytes = bench_pair(
+                "keybuild 10k", asi_keys_batch, v11_keys
+            )
 
             asi_key_bytes = [bytes(k.data) for k in asi_keys]
             same_keys = asi_key_bytes == [bytes(k) for k in v11_key_bytes]
@@ -147,25 +162,46 @@ async def main():
             t0 = time.perf_counter()
             for p in params[:1000]:
                 StorageKey.create_from_storage_function(
-                    "System", "Account", p,
-                    runtime_config=runtime.runtime_config, metadata=runtime.metadata,
+                    "System",
+                    "Account",
+                    p,
+                    runtime_config=runtime.runtime_config,
+                    metadata=runtime.metadata,
                 )
             loop_time = time.perf_counter() - t0
-            print(f"  (asi notebook-style per-key loop: {loop_time*10*1000:.0f}ms extrapolated to 10k)", flush=True)
+            print(
+                f"  (asi notebook-style per-key loop: {loop_time * 10 * 1000:.0f}ms extrapolated to 10k)",
+                flush=True,
+            )
 
             # ---------------- Phase 2: fetch raw values once ----------------
-            print("\n== Phase 2: fetch raw values (once, shared by both) ==", flush=True)
+            print(
+                "\n== Phase 2: fetch raw values (once, shared by both) ==", flush=True
+            )
             hex_keys = ["0x" + k.hex() for k in asi_key_bytes]
             t0 = time.perf_counter()
             raw_hexes = await rpc_chunked_query_storage_at(asi, hex_keys, block_hash)
             n_found = sum(1 for r in raw_hexes if r is not None)
-            print(f"  fetched {len(raw_hexes)} raws ({n_found} exist) in {time.perf_counter()-t0:.2f}s", flush=True)
+            print(
+                f"  fetched {len(raw_hexes)} raws ({n_found} exist) in {time.perf_counter() - t0:.2f}s",
+                flush=True,
+            )
 
             with open(f"{SCRATCH}/account_raws.pkl", "wb") as f:
-                pickle.dump({"block_hash": block_hash, "hex_keys": hex_keys, "raw_hexes": raw_hexes}, f)
+                pickle.dump(
+                    {
+                        "block_hash": block_hash,
+                        "hex_keys": hex_keys,
+                        "raw_hexes": raw_hexes,
+                    },
+                    f,
+                )
 
             # ---------------- Phase 3: decode 10k account values (CPU) ----------------
-            print("\n== Phase 3: decode 10k System.Account responses (CPU, identical raw data) ==", flush=True)
+            print(
+                "\n== Phase 3: decode 10k System.Account responses (CPU, identical raw data) ==",
+                flush=True,
+            )
 
             def asi_decode():
                 # mirrors query_multi's post-response processing
@@ -177,10 +213,15 @@ async def main():
 
             def v11_decode():
                 # mirrors query_batch's post-response processing
-                raws = [bytes.fromhex(rh[2:]) if rh is not None else None for rh in raw_hexes]
+                raws = [
+                    bytes.fromhex(rh[2:]) if rh is not None else None
+                    for rh in raw_hexes
+                ]
                 return decode_storage_values(codec, entry, raws)
 
-            asi_vals, v11_vals = bench_pair("decode 10k accounts", asi_decode, v11_decode)
+            asi_vals, v11_vals = bench_pair(
+                "decode 10k accounts", asi_decode, v11_decode
+            )
             d_asi = [digest(v) for v in asi_vals]
             d_v11 = [digest(v) for v in v11_vals]
             same = d_asi == d_v11
@@ -194,8 +235,15 @@ async def main():
                         break
 
             # ---------------- Phase 4: query_map page decode (CPU) ----------------
-            for pallet, item in [("System", "Account"), ("SubtensorModule", "Keys"), ("SubtensorModule", "Bonds")]:
-                print(f"\n== Phase 4: decode one 1000-entry query_map page of {pallet}.{item} (CPU) ==", flush=True)
+            for pallet, item in [
+                ("System", "Account"),
+                ("SubtensorModule", "Keys"),
+                ("SubtensorModule", "Bonds"),
+            ]:
+                print(
+                    f"\n== Phase 4: decode one 1000-entry query_map page of {pallet}.{item} (CPU) ==",
+                    flush=True,
+                )
                 entry2 = codec.storage_entry(pallet, item)
                 mp = runtime.metadata.get_metadata_pallet(pallet)
                 si = mp.get_storage_function(item)
@@ -203,7 +251,11 @@ async def main():
                 param_types = si.get_params_type_string()
                 key_hashers = si.get_param_hashers()
                 prefix_key = StorageKey.create_from_storage_function(
-                    pallet, item, [], runtime_config=runtime.runtime_config, metadata=runtime.metadata
+                    pallet,
+                    item,
+                    [],
+                    runtime_config=runtime.runtime_config,
+                    metadata=runtime.metadata,
                 )
                 prefix = prefix_key.to_hex()
 
@@ -211,7 +263,9 @@ async def main():
                     "state_getKeysPaged", [prefix, 1000, prefix, block_hash]
                 )
                 page_keys = keys_resp["result"]
-                vals_resp = await asi.rpc_request("state_queryStorageAt", [page_keys, block_hash])
+                vals_resp = await asi.rpc_request(
+                    "state_queryStorageAt", [page_keys, block_hash]
+                )
                 changes = []
                 for group in vals_resp["result"]:
                     changes.extend(group["changes"])
@@ -219,26 +273,47 @@ async def main():
 
                 def asi_map_decode():
                     return decode_query_map(
-                        changes, prefix, runtime, param_types, [], value_type, key_hashers, False
+                        changes,
+                        prefix,
+                        runtime,
+                        param_types,
+                        [],
+                        value_type,
+                        key_hashers,
+                        False,
                     )
 
                 def v11_map_decode():
-                    return decode_map_pairs(codec, entry2, [], [tuple(c) for c in changes])
+                    return decode_map_pairs(
+                        codec, entry2, [], [tuple(c) for c in changes]
+                    )
 
-                asi_page, v11_page = bench_pair(f"map page {pallet}.{item}", asi_map_decode, v11_map_decode)
+                asi_page, v11_page = bench_pair(
+                    f"map page {pallet}.{item}", asi_map_decode, v11_map_decode
+                )
                 da = sorted(digest(kv) for kv in asi_page)
-                db = sorted(digest((list(kv) if isinstance(kv, tuple) else kv)) for kv in [[k, v] for k, v in v11_page])
+                db = sorted(
+                    digest((list(kv) if isinstance(kv, tuple) else kv))
+                    for kv in [[k, v] for k, v in v11_page]
+                )
                 print(f"  page decode identical (unordered): {da == db}", flush=True)
                 if da != db:
                     print(f"    asi sample: {canonical(asi_page[0])}")
                     print(f"    v11 sample: {canonical(list(v11_page[0]))}")
 
             # ---------------- Phase 5: end-to-end (network, matched) ----------------
-            print("\n== Phase 5: end-to-end query_batch 10k accounts (network, matched, 3 repeats) ==", flush=True)
+            print(
+                "\n== Phase 5: end-to-end query_batch 10k accounts (network, matched, 3 repeats) ==",
+                flush=True,
+            )
 
             async def asi_e2e():
-                keys = await asi.create_storage_keys("System", "Account", params, block_hash=block_hash)
-                return await asi.query_multi(keys, block_hash=block_hash, runtime=runtime)
+                keys = await asi.create_storage_keys(
+                    "System", "Account", params, block_hash=block_hash
+                )
+                return await asi.query_multi(
+                    keys, block_hash=block_hash, runtime=runtime
+                )
 
             async def v11_e2e():
                 return await client._substrate.query_batch(
@@ -252,12 +327,22 @@ async def main():
                     r = await fn()
                     times.append(time.perf_counter() - t0)
                     await asyncio.sleep(0.5)
-                print(f"  e2e query_batch 10k  {name:<4} median={statistics.median(times)*1000:9.1f}ms  "
-                      f"min={min(times)*1000:9.1f}ms  n={len(r)}", flush=True)
+                print(
+                    f"  e2e query_batch 10k  {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
+                    f"min={min(times) * 1000:9.1f}ms  n={len(r)}",
+                    flush=True,
+                )
 
-            print("\n== Phase 6: end-to-end get_block (network, 5 repeats) ==", flush=True)
+            print(
+                "\n== Phase 6: end-to-end get_block (network, 5 repeats) ==", flush=True
+            )
             for name, fn in (
-                ("asi", lambda: asi.get_block(block_hash=block_hash, ignore_decoding_errors=True)),
+                (
+                    "asi",
+                    lambda: asi.get_block(
+                        block_hash=block_hash, ignore_decoding_errors=True
+                    ),
+                ),
                 ("v11", lambda: client._substrate.get_block(block_hash=block_hash)),
             ):
                 times = []
@@ -265,12 +350,18 @@ async def main():
                     t0 = time.perf_counter()
                     r = await fn()
                     times.append(time.perf_counter() - t0)
-                print(f"  e2e get_block        {name:<4} median={statistics.median(times)*1000:9.1f}ms  "
-                      f"min={min(times)*1000:9.1f}ms", flush=True)
+                print(
+                    f"  e2e get_block        {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
+                    f"min={min(times) * 1000:9.1f}ms",
+                    flush=True,
+                )
 
             print("\n==== CPU summary (median, asi vs v11) ====", flush=True)
             for label, a, v in results_table:
-                print(f"  {label:<40} asi={a*1000:9.1f}ms  v11={v*1000:9.1f}ms  ratio={a/v if v else float('inf'):.2f}x", flush=True)
+                print(
+                    f"  {label:<40} asi={a * 1000:9.1f}ms  v11={v * 1000:9.1f}ms  ratio={a / v if v else float('inf'):.2f}x",
+                    flush=True,
+                )
 
 
 asyncio.run(main())
