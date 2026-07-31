@@ -108,29 +108,40 @@ e2e_table: list[tuple[str, float, float]] = []
 
 
 async def e2e_pair(label, fn_asi, fn_v11, repeats, warmup=1, pause=0.2):
-    """Time two async callables end-to-end (network included), asi first."""
-    out = {}
-    for name, fn in (("asi", fn_asi), ("v11", fn_v11)):
-        for _ in range(warmup):
-            await fn()
-        times = []
-        last = None
-        for _ in range(repeats):
+    """Time two async callables end-to-end (network included).
+
+    Repeats are interleaved with alternating order: server-side effects
+    (state/trie caches, WASM instances warmed by the first execution of an
+    expensive state_call) would otherwise systematically favor whichever
+    library runs second.
+    """
+    for _ in range(warmup):
+        await fn_asi()
+        await fn_v11()
+    times: dict[str, list[float]] = {"asi": [], "v11": []}
+    last: dict[str, Any] = {"asi": None, "v11": None}
+    for i in range(repeats):
+        order = [("asi", fn_asi), ("v11", fn_v11)]
+        if i % 2:
+            order.reverse()
+        for name, fn in order:
             t0 = time.perf_counter()
-            last = await fn()
-            times.append(time.perf_counter() - t0)
+            last[name] = await fn()
+            times[name].append(time.perf_counter() - t0)
             if pause:
                 await asyncio.sleep(pause)
-        out[name] = (statistics.median(times), min(times), last)
+    for name in ("asi", "v11"):
         print(
-            f"  {label:<40} {name:<4} median={statistics.median(times) * 1000:9.1f}ms  "
-            f"min={min(times) * 1000:9.1f}ms",
+            f"  {label:<40} {name:<4} median={statistics.median(times[name]) * 1000:9.1f}ms  "
+            f"min={min(times[name]) * 1000:9.1f}ms",
             flush=True,
         )
-    ratio = out["asi"][0] / out["v11"][0] if out["v11"][0] else float("inf")
+    med_asi = statistics.median(times["asi"])
+    med_v11 = statistics.median(times["v11"])
+    ratio = med_asi / med_v11 if med_v11 else float("inf")
     print(f"  {label:<40} asi/v11 = {ratio:.2f}x", flush=True)
-    e2e_table.append((label, out["asi"][0], out["v11"][0]))
-    return out["asi"][2], out["v11"][2]
+    e2e_table.append((label, med_asi, med_v11))
+    return last["asi"], last["v11"]
 
 
 def prefix_of(pallet: str, item: str, runtime) -> str:
