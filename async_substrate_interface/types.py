@@ -2,7 +2,7 @@ import bisect
 import logging
 import os
 from abc import ABC
-from collections import defaultdict, deque, OrderedDict
+from collections import defaultdict, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,7 +16,7 @@ from scalecodec.types import GenericCall, MultiAccountId
 from scalecodec.utils.ss58 import ss58_encode, ss58_decode, is_valid_ss58_address
 
 from .const import SS58_FORMAT
-from .utils.cache import AsyncSqliteDB, LRUCache
+from .utils.cache import LRUCache
 
 logger = logging.getLogger("async_substrate_interface")
 SUBSTRATE_RUNTIME_CACHE_SIZE = int(os.getenv("SUBSTRATE_RUNTIME_CACHE_SIZE", "16"))
@@ -157,43 +157,6 @@ class RuntimeCache:
                 self.last_used = runtime
                 return runtime
         return runtime
-
-    async def load_from_disk(self, chain_endpoint: str):
-        db = AsyncSqliteDB(chain_endpoint=chain_endpoint)
-        (
-            block_mapping,
-            block_hash_mapping,
-            runtime_version_mapping,
-        ) = await db.load_runtime_cache(chain_endpoint)
-        if not any([block_mapping, block_hash_mapping, runtime_version_mapping]):
-            logger.debug("No runtime mappings in disk cache")
-        else:
-            logger.debug("Found runtime mappings in disk cache")
-        self.blocks.cache = block_mapping
-        self.blocks_reverse.cache = OrderedDict(
-            {v: k for k, v in block_mapping.items()}
-        )
-        self.block_hashes.cache = block_hash_mapping
-        for x, y in runtime_version_mapping.items():
-            self.versions.cache[x] = y
-        self._persisted_version_keys = set(runtime_version_mapping.keys())
-
-    async def dump_to_disk(self, chain_endpoint: str):
-        db = AsyncSqliteDB(chain_endpoint=chain_endpoint)
-        blocks = self.blocks.cache
-        block_hashes = self.block_hashes.cache
-        new_versions = {
-            k: v
-            for k, v in self.versions.cache.items()
-            if k not in self._persisted_version_keys
-        }
-        await db.dump_runtime_cache(
-            chain=chain_endpoint,
-            block_mapping=blocks,
-            block_hash_mapping=block_hashes,
-            version_mapping=new_versions,
-        )
-        self._persisted_version_keys.update(new_versions.keys())
 
 
 def _propagate_runtime_config(obj, runtime_config, _seen=None):

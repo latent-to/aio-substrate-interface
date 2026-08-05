@@ -10,7 +10,7 @@ which was archived
 Additionally, this project uses [cyscale](https://github.com/latent-to/cyscale) instead
 of [py-scale-codec](https://github.com/polkascan/py-scale-codec) for
 faster [SCALE](https://docs.substrate.io/reference/scale-codec/) decoding. Since v2.0, because cyscale and
-py-substrate-interface share the same namespace, we require that only
+py-scale-codec share the same namespace, we require that only
 cyscale is installed to be able to use this. If you run into a runtime error stating that both cannot be installed at
 the same time, simply remove them both, and reinstall cyscale:
 
@@ -28,29 +28,6 @@ pip install aio-substrate-interface
 ```
 
 ## Usage
-
-Here are examples of how to use the sync and async interfaces:
-
-```python
-from async_substrate_interface import SubstrateInterface
-
-
-def main():
-    substrate = SubstrateInterface(
-        url="wss://rpc.polkadot.io"
-    )
-    with substrate:
-        result = substrate.query(
-            module='System',
-            storage_function='Account',
-            params=['5CZs3T15Ky4jch1sUpSFwkUbYEnsCfe1WCY51fH3SPV6NFnf']
-        )
-
-        print(result)
-
-
-main()
-```
 
 ```python
 import asyncio
@@ -76,19 +53,14 @@ asyncio.run(main())
 
 ### Caching
 
-There are a few different cache types used in this library to improve the performance overall. The one with which
-you are probably familiar is the typical `functools.lru_cache` used in `sync_substrate.SubstrateInterface`.
+Caching is used to improve the overall performance of this library. It is applied only on methods whose results
+cannot change — such as the block hash for a given block number (small, 512 default max size), or the runtime for a
+given runtime version (large, 16 default max size). These cache sizes are user-configurable using the respective env
+vars, `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE`.
 
-By default, it uses a max cache size of 512 for smaller returns, and 16 for larger ones. These cache sizes are
-user-configurable using the respective env vars, `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE`.
-
-They are applied only on methods whose results cannot change — such as the block hash for a given block number
-(small, 512 default), or the runtime for a given runtime version (large, 16 default).
-
-Additionally, in `AsyncSubstrateInterface`, because of its asynchronous nature, we developed our own asyncio-friendly
-LRU caches. The primary one is the `CachedFetcher` which wraps the same methods as `functools.lru_cache` does in
-`SubstrateInterface`, but the key difference here is that each request is assigned a future that is returned when the
-initial request completes. So, if you were to do:
+Because of the asynchronous nature of the library, rather than something like `functools.lru_cache`, we developed our
+own asyncio-friendly LRU cache, `CachedFetcher`. The key difference here is that each request is assigned a future
+that is returned when the initial request completes. So, if you were to do:
 
 ```python
 bn = 5000
@@ -98,34 +70,22 @@ bh1, bh2 = await asyncio.gather(
 )
 ```
 
-it would actually only make one single network call, and return the result to both requests. Like `SubstrateInterface`,
-it also takes the `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE` vars to set cache size.
-
-The third and final caching mechanism we use is
-`async_substrate_interface.async_substrate.DiskCachedAsyncSubstrateInterface`,
-which functions the same as the normal `AsyncSubstrateInterface`, but that also saves this cache to the disk, so the
-cache
-is preserved between runs. This is product for a fairly nice use-case (such as `btcli`). As you may call different
-networks
-with entirely different results, this cache is keyed by the uri supplied at instantiation of the
-`DiskCachedAsyncSubstrateInterface`
-object, so `DiskCachedAsyncSubstrateInterface(network_1)` and `DiskCachedAsyncSubstrateInterface(network_2)` will not
-share the same on-disk cache.
-
-As with the other two caches, this also takes `SUBSTRATE_CACHE_METHOD_SIZE` and `SUBSTRATE_RUNTIME_CACHE_SIZE` env vars.
+it would actually only make one single network call, and return the result to both requests.
 
 ### ENV VARS
 
-The following environment variables are used within async-substrate-interface
+The following environment variables are used within aio-substrate-interface
 
-- NO_CACHE (default 0): if set to 1, when using the DiskCachedAsyncSubstrateInterface class, no persistent on-disk cache
-  will be stored, instead using only in-memory cache.
-- CACHE_LOCATION (default `~/.cache/async-substrate-interface`): this determines the location for the cache file, if
-  using DiskCachedAsyncSubstrateInterface
-- SUBSTRATE_CACHE_METHOD_SIZE (default 512): the cache size (either in-memory or on-disk) of the smaller return-size
+- SUBSTRATE_CACHE_METHOD_SIZE (default 512): the cache size of the smaller return-size
   methods (see the Caching section for more info)
-- SUBSTRATE_RUNTIME_CACHE_SIZE (default 16): the cache size (either in-memory or on-disk) of the larger return-size
+- SUBSTRATE_RUNTIME_CACHE_SIZE (default 16): the cache size of the larger return-size
   methods (see the Caching section for more info)
+- SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH (default 16): how many blocks are walked back per check when recovering a
+  watched extrinsic whose subscription was severed by a websocket reconnection
+- SUBSTRATE_EXTRINSIC_RECOVERY_TIMEOUT (default 120): seconds to wait for inclusion/finalization of an
+  already-submitted extrinsic when its watch subscription is being recovered by polling
+- SUBSTRATE_EXTRINSIC_RECOVERY_POLL_INTERVAL (default 1): seconds between chain polls while recovering a watched
+  extrinsic
 
 ## Contributing
 

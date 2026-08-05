@@ -1,9 +1,49 @@
 # Changelog
 
+## 3.0.0 /2026-08-03
+
+### Breaking Changes
+
+* The library is now async-only: the sync `SubstrateInterface`, `ExtrinsicReceipt`, and `QueryMapResult` classes have
+  been removed (`sync_substrate.py` deleted), along with `RetrySyncSubstrate` in `substrate_addons`. Use
+  `AsyncSubstrateInterface` / `RetryAsyncSubstrate` instead.
+* `DiskCachedAsyncSubstrateInterface` and the on-disk (sqlite) cache have been removed. Caching is in-memory only;
+  the `NO_CACHE` and `CACHE_LOCATION` env vars are no longer used, and the `aiosqlite` dependency has been dropped.
+* cyscale requirement bumped to `>=0.7.0`. As of cyscale 0.6, decoded values are returned as plain Python types
+  rather than being wrapped in `ScaleType` objects, and this library now relies on that behavior.
+
+### Connection Resilience
+
+* Subscriptions are now recovered when the websocket reconnects: active subscriptions are re-established on the new
+  connection, and subscriptions that cannot be recovered are orphaned with an error surfaced to their consumers.
+* Extrinsics being watched (`wait_for_inclusion`/`wait_for_finalization`) whose subscription is severed by a
+  reconnect are no longer lost: the library polls the transaction pool and scans recent blocks to find the
+  already-submitted extrinsic and resume waiting for inclusion/finalization. Tunable via the new
+  `SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH` (default 16), `SUBSTRATE_EXTRINSIC_RECOVERY_TIMEOUT` (default 120), and
+  `SUBSTRATE_EXTRINSIC_RECOVERY_POLL_INTERVAL` (default 1) env vars.
+* Unified retry accounting with backoff on consecutive connection failures; the retry counter is no longer reset
+  incorrectly on exit or by a successful in-flight task while still reconnecting.
+* Fixed a potential DNS-resolution lockup, missing `ConnectionClosed` handling in the SSL error path, error handling
+  in forced reconnects (`connect(True)`), and unbounded recursion in `_wait_with_activity_timeout` (rewritten as
+  loops). Added a unit-test suite (`tests/unit_tests/asyncio_/test_websocket_resilience.py`) covering these
+  scenarios.
+
+### Performance
+
+* Faster storage-query preprocessing and batched `StorageKey` preparation.
+* Fast-path decoding for `System.Events`.
+* General optimisations enabled by cyscale 0.6/0.7's plain-Python decoding.
+* Added a `benchmarks/` suite: local RPC latency, runtime calls, and real-world scenario comparisons against the
+  bittensor v11 stack, reproducible against a fixed block number.
+
+**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v2.2.1...v3.0.0
+
 ## 2.2.1 /2026-06-29
 
 ## What's Changed
-* Fix websocket poison connection and leaks on failed requests by @basfroman in https://github.com/latent-to/async-substrate-interface/pull/367
+
+* Fix websocket poison connection and leaks on failed requests by @basfroman
+  in https://github.com/latent-to/async-substrate-interface/pull/367
 
 **Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v2.2.0...v2.2.1
 

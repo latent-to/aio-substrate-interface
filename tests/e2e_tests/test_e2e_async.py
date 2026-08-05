@@ -753,7 +753,7 @@ async def test_legacy_decoding(substrate):
         "Now",
         block_hash=block_hash,
     )
-    assert timestamp.value == 1716358476004
+    assert timestamp == 1716358476004
     print("test_legacy_decoding succeeded")
 
 

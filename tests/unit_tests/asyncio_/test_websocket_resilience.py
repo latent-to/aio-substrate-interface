@@ -10,19 +10,28 @@ shared connection ("poison pill").
 be misrouted to a reused id.
 - A done future whose `result()` raises must not release its permit inside `retrieve`; the paired `discard_request`
 owns that single release, so a mid-flight transport error can never double-release the subscription semaphore.
+- Reconnection locking: a forced (handler-driven) reconnect serializes on the connection lock rather than bypassing
+it, and an unforced `connect` defers to a live handler instead of cancelling it mid-reconnect.
 """
 
 import asyncio
+import json
+import socket
 from contextlib import suppress
+from hashlib import blake2b
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from scalecodec.types import GenericExtrinsic
+from websockets.asyncio.server import serve
 from websockets.protocol import State
 
+import async_substrate_interface.async_substrate
 from async_substrate_interface.async_substrate import (
     AsyncSubstrateInterface,
     Websocket,
 )
+from async_substrate_interface.errors import SubstrateRequestException
 
 
 def _make_payload(id_: str) -> dict:
@@ -69,6 +78,12 @@ class _FakePoisonWs:
         item_id = f"id{self._sent}"
         self._sent += 1
         return item_id
+
+    def arm_response_event(self):
+        pass
+
+    async def wait_response_event(self, timeout: float = 0.1):
+        pass
 
     async def retrieve(self, item_id):
         raise TimeoutError("Max retries exceeded.")
@@ -227,3 +242,473 @@ async def test_failed_retrieve_then_discard_releases_permit_once():
     assert ws.max_subscriptions._value == permits_after_send + 1
     assert item_id not in ws._received
     assert item_id not in ws._inflight
+
+
+# --- Subscription recovery after reconnection ---------------------------------------------------
+
+
+def _sub_message(sub_id: str, result) -> dict:
+    return {"jsonrpc": "2.0", "params": {"subscription": sub_id, "result": result}}
+
+
+@pytest.mark.asyncio
+async def test_recovered_subscription_is_aliased_to_original_id():
+    """
+    A recoverer that re-establishes its subscription returns the new server-side id; messages arriving
+    under that id must be routed to the original consumer queue, and `unsubscribe` must both address the
+    server by the new id and clean up all recovery state.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        return "new-sub"
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    # tracked (and therefore recoverable/connection-keeping) even before any notification arrives
+    assert "old-sub" in ws._received_subscriptions
+
+    await ws._recover_subscriptions()
+
+    await ws._dispatch_response(_sub_message("new-sub", {"inBlock": "0xabc"}))
+    queued = ws._received_subscriptions["old-sub"].get_nowait()
+    assert queued["params"]["result"] == {"inBlock": "0xabc"}
+
+    await ws.unsubscribe("old-sub")
+    sent = await ws._sending.get()
+    assert sent["params"] == ["new-sub"]
+    assert "old-sub" not in ws._subscription_recoverers
+    assert "old-sub" not in ws._received_subscriptions
+    assert ws._sub_alias_to_original == {}
+    assert ws._sub_original_to_alias == {}
+
+
+@pytest.mark.asyncio
+async def test_recovery_drains_messages_that_raced_in_under_new_id():
+    """Notifications that arrive under the new id before the alias is registered must not be lost."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        await ws._dispatch_response(_sub_message("new-sub", "early"))
+        return "new-sub"
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    assert "new-sub" not in ws._received_subscriptions
+    early = ws._received_subscriptions["old-sub"].get_nowait()
+    assert early["params"]["result"] == "early"
+
+
+@pytest.mark.asyncio
+async def test_recoverer_can_settle_subscription_by_injection():
+    """A recoverer that resolves the subscription out-of-band injects terminal messages and returns None."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        await ws.inject_subscription_message(
+            "old-sub", _sub_message("old-sub", {"finalized": "0xdef"})
+        )
+        return None
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    settled = ws._received_subscriptions["old-sub"].get_nowait()
+    assert settled["params"]["result"] == {"finalized": "0xdef"}
+    assert ws._sub_alias_to_original == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_injects_recovery_failed_message():
+    """A raising recoverer must surface a recoveryFailed message for the consumer instead of vanishing."""
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        raise SubstrateRequestException("node unreachable")
+
+    ws.register_subscription_recoverer("old-sub", recoverer)
+    await ws._recover_subscriptions()
+
+    message = ws._received_subscriptions["old-sub"].get_nowait()
+    assert message["params"]["result"] == {"recoveryFailed": "node unreachable"}
+    assert "old-sub" not in ws._recovering_subscriptions
+
+
+# --- Reconnection locking ------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forced_connect_waits_for_lock():
+    """
+    A forced (handler-driven) reconnect must serialize on the connection lock instead of bypassing it:
+    racing an unforced `connect` would otherwise create two sockets and orphan one.
+
+    The historical reason for the bypass — `_connect_internal` recursively re-entering `connect()` on
+    DNS failure, which would deadlock on the already-held lock — no longer exists; that retry is now a
+    loop inside `_connect_internal` that never re-enters `connect`.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+    calls = []
+
+    async def fake_connect_internal(force):
+        calls.append(force)
+
+    ws._connect_internal = fake_connect_internal
+
+    await ws._lock.acquire()
+    try:
+        task = asyncio.create_task(ws.connect(True))
+        await asyncio.sleep(0.05)
+        # pre-fix, force=True proceeded without the lock and would already have connected here
+        assert calls == []
+        assert not task.done()
+    finally:
+        ws._lock.release()
+    await asyncio.wait_for(task, timeout=5)
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_unforced_connect_defers_to_live_handler():
+    """
+    While the handler task is alive (e.g. mid-reconnect, in a backoff sleep), an unforced `connect` —
+    a consumer's `__aenter__` seeing a CLOSED socket — must leave the connection alone. Pre-fix, its
+    `_cancel` killed the reconnecting handler, stranding the resubmitted in-flight requests and
+    skipping subscription recovery entirely.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None, max_retries=1)
+    # stands in for a live handler that is mid-reconnect
+    handler = asyncio.create_task(asyncio.sleep(3600))
+    ws._send_recv_task = handler
+
+    cancel_calls = []
+
+    async def spy_cancel():
+        cancel_calls.append(True)
+
+    ws._cancel = spy_cancel
+
+    async def failing_resolve():
+        raise socket.gaierror("connect must not attempt its own connection here")
+
+    ws._resolve_host = failing_resolve
+
+    try:
+        await asyncio.wait_for(ws.connect(), timeout=5)
+        assert cancel_calls == []
+        assert not handler.done()
+        assert ws.ws is None
+    finally:
+        handler.cancel()
+        with suppress(asyncio.CancelledError):
+            await handler
+
+
+@pytest.mark.asyncio
+async def test_reconnect_survives_concurrent_consumer_connects():
+    """
+    End-to-end over a loopback server: an abnormal close triggers the handler's reconnect, the pending
+    request is resubmitted and answered on the new connection, and consumer-side `connect()` calls fired
+    throughout the window neither deadlock against the (now lock-holding) forced reconnect nor kill the
+    handler mid-reconnect.
+    """
+    connections = []
+
+    async def server_handler(server_ws):
+        connections.append(server_ws)
+        first = len(connections) == 1
+        with suppress(Exception):
+            async for message in server_ws:
+                request = json.loads(message)
+                if first:
+                    # drop the first connection abruptly instead of answering
+                    await server_ws.close(code=1011, reason="restart")
+                    return
+                await server_ws.send(
+                    json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": "ok"})
+                )
+
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        ws = Websocket(f"ws://127.0.0.1:{port}", shutdown_timer=None, retry_timeout=5)
+        try:
+            async with ws:
+                handler_task = ws._send_recv_task
+                item_id = await ws.send(
+                    {"jsonrpc": "2.0", "method": "echo", "params": []}
+                )
+
+                async def consumer_connects():
+                    for _ in range(40):
+                        await ws.connect()
+                        await asyncio.sleep(0.005)
+
+                async def poll_response():
+                    while True:
+                        if (resp := await ws.retrieve(item_id)) is not None:
+                            return resp
+                        await asyncio.sleep(0.01)
+
+                response, _ = await asyncio.wait_for(
+                    asyncio.gather(poll_response(), consumer_connects()), timeout=15
+                )
+                assert response["result"] == "ok"
+                assert len(connections) >= 2  # actually reconnected
+                # the original handler survived both the reconnect and the concurrent connects
+                assert ws._send_recv_task is handler_task
+                assert not handler_task.done()
+        finally:
+            await ws.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_subscription_fails_consumer_on_next_retrieve():
+    """
+    A subscription with no recoverer cannot survive a reconnect. Instead of silently orphaning it
+    (pre-fix, its consumer polled an abandoned queue forever) or refusing to reconnect at all
+    (pre-fix, the handler path stranded every other request over it), it is dropped and its
+    consumer's next `retrieve` raises. Recoverable subscriptions are untouched.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def recoverer():
+        return "rec-sub-new"
+
+    ws.register_subscription_recoverer("rec-sub", recoverer)
+    ws._received_subscriptions["orphan-sub"] = asyncio.Queue()
+
+    orphaned = ws._orphan_unrecoverable_subscriptions()
+
+    assert orphaned == ["orphan-sub"]
+    assert "orphan-sub" not in ws._received_subscriptions
+    assert "rec-sub" in ws._received_subscriptions
+
+    with pytest.raises(SubstrateRequestException, match="no recovery handler"):
+        await ws.retrieve("orphan-sub")
+    # delivered once; subsequent polls see a plain miss, not a repeat error
+    assert await ws.retrieve("orphan-sub") is None
+
+
+@pytest.mark.asyncio
+async def test_handler_reports_error_when_sibling_task_was_cancelled():
+    """
+    When one pump task dies with a non-reconnect exception, the still-pending sibling is cancelled.
+    Reading the cancelled sibling's `.result()` raised CancelledError pre-fix, which made the handler
+    task itself read as cancelled — and `retrieve` deliberately ignores cancelled handlers, so
+    consumers polled None forever instead of receiving the real error.
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+    boom = ValueError("malformed frame")
+
+    async def hanging_recv(_ws):
+        await asyncio.sleep(3600)
+
+    async def failing_send(_ws):
+        return boom
+
+    ws._start_receiving = hanging_recv
+    ws._start_sending = failing_send
+
+    handler = asyncio.ensure_future(ws._handler(MagicMock()))
+    await asyncio.wait([handler], timeout=5)
+    assert handler.done()
+    assert not handler.cancelled()
+    assert handler.result() is boom
+
+    # consumers polling retrieve must now receive the real error
+    ws._send_recv_task = handler
+    with pytest.raises(ValueError, match="malformed frame"):
+        await ws.retrieve("anything")
+
+
+@pytest.mark.asyncio
+async def test_revived_handler_orphans_and_recovers_subscriptions():
+    """
+    Reviving a dead handler must apply the same subscription policy as the handler's own reconnect
+    path: recoverable subscriptions are re-established (pre-fix they were silently forgotten), and
+    unrecoverable ones are failed explicitly (pre-fix they were silently orphaned).
+    """
+    ws = Websocket("ws://fake:9944", shutdown_timer=None)
+
+    async def _dead():
+        return TimeoutError("Max retries exceeded.")
+
+    ws._send_recv_task = asyncio.ensure_future(_dead())
+    await ws._send_recv_task
+
+    recoverer_calls = []
+
+    async def recoverer():
+        recoverer_calls.append(True)
+        return "rec-sub-new"
+
+    ws.register_subscription_recoverer("rec-sub", recoverer)
+    ws._received_subscriptions["orphan-sub"] = asyncio.Queue()
+
+    async def fake_connect_internal(force):
+        ws.ws = MagicMock(state=State.OPEN)
+        ws._send_recv_task = asyncio.ensure_future(asyncio.sleep(3600))
+
+    ws._connect_internal = fake_connect_internal
+
+    try:
+        await ws.__aenter__()
+        await asyncio.gather(*ws._recovery_tasks)
+
+        assert recoverer_calls == [True]
+        assert ws._sub_original_to_alias == {"rec-sub": "rec-sub-new"}
+        with pytest.raises(SubstrateRequestException, match="no recovery handler"):
+            await ws.retrieve("orphan-sub")
+    finally:
+        ws._send_recv_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ws._send_recv_task
+
+
+# --- Extrinsic recovery chain queries ------------------------------------------------------------
+
+
+_EXT_HEX = "0x280403000b63ce64c10c05"
+_EXT_HASH = f"0x{blake2b(bytes.fromhex(_EXT_HEX[2:]), digest_size=32).hexdigest()}"
+
+
+def _block(number: int, parent: str, extrinsics: list[str]) -> dict:
+    return {
+        "header": {"number": hex(number), "parentHash": parent},
+        "extrinsics": extrinsics,
+    }
+
+
+def _substrate_with_chain(blocks: dict[str, dict], heads: list[str]):
+    """
+    An interface whose `rpc_request` serves a static chain: `blocks` maps block hash to a
+    `chain_getBlock` block, and each head request pops the next entry of `heads` (the last is sticky).
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+    remaining_heads = list(heads)
+
+    async def rpc_request(method, params, **kwargs):
+        if method == "chain_getBlock":
+            return {"result": {"block": blocks[params[0]]}}
+        if method in ("chain_getBlockHash", "chain_getFinalizedHead"):
+            return {
+                "result": remaining_heads.pop(0)
+                if len(remaining_heads) > 1
+                else remaining_heads[0]
+            }
+        raise AssertionError(f"Unexpected RPC method {method}")
+
+    substrate.rpc_request = rpc_request
+    return substrate
+
+
+@pytest.mark.asyncio
+async def test_scan_recent_blocks_finds_included_extrinsic():
+    blocks = {
+        "0xb2": _block(2, "0xb1", []),
+        "0xb1": _block(1, "0xb0", [_EXT_HEX]),
+        "0xb0": _block(0, "0x00", []),
+    }
+    substrate = _substrate_with_chain(blocks, ["0xb2"])
+
+    scanned: set[str] = set()
+    found = await substrate._scan_recent_blocks_for_extrinsic(
+        _EXT_HASH, "0xb2", 16, scanned
+    )
+    assert found == "0xb1"
+    assert scanned == {"0xb2", "0xb1"}
+
+    # an unknown extrinsic walks back to genesis and gives up
+    assert (
+        await substrate._scan_recent_blocks_for_extrinsic("0xdead", "0xb2", 16, set())
+        is None
+    )
+    # already-scanned blocks are not re-fetched
+    assert (
+        await substrate._scan_recent_blocks_for_extrinsic("0xdead", "0xb2", 16, scanned)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_polling_watch_sees_extrinsic_included_in_later_block(monkeypatch):
+    """The polling watcher finds an extrinsic that lands in a block only after the first poll."""
+    monkeypatch.setattr(
+        async_substrate_interface.async_substrate,
+        "EXTRINSIC_RECOVERY_POLL_INTERVAL",
+        0.01,
+    )
+    blocks = {
+        "0xb2": _block(2, "0xb1", [_EXT_HEX]),
+        "0xb1": _block(1, "0xb0", []),
+        "0xb0": _block(0, "0x00", []),
+    }
+    substrate = _substrate_with_chain(blocks, ["0xb1", "0xb2"])
+
+    result = await substrate._wait_for_extrinsic_inclusion_via_polling(
+        _EXT_HASH, False, timeout=5
+    )
+    assert result == {
+        "block_hash": "0xb2",
+        "extrinsic_hash": _EXT_HASH,
+        "finalized": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_polling_watch_times_out(monkeypatch):
+    monkeypatch.setattr(
+        async_substrate_interface.async_substrate,
+        "EXTRINSIC_RECOVERY_POLL_INTERVAL",
+        0.01,
+    )
+    blocks = {"0xb0": _block(0, "0x00", [])}
+    substrate = _substrate_with_chain(blocks, ["0xb0"])
+
+    with pytest.raises(SubstrateRequestException, match="not observed within"):
+        await substrate._wait_for_extrinsic_inclusion_via_polling(
+            _EXT_HASH, True, timeout=0.05
+        )
+
+
+def _fake_extrinsic() -> MagicMock:
+    extrinsic = MagicMock(spec=GenericExtrinsic)
+    extrinsic.data = _EXT_HEX
+    extrinsic.extrinsic_hash = bytes.fromhex(_EXT_HASH[2:])
+    return extrinsic
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_submit_treats_already_imported_as_success():
+    """
+    A reconnection can re-send an in-flight `author_submitExtrinsic`; the node then answers the resent
+    copy with "Transaction Already Imported" even though the submission succeeded. The fire-and-forget
+    branch of `submit_extrinsic` must map that to a normal receipt (the hash is deterministic from the
+    signed bytes), matching what the watch branch already does.
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+
+    async def rpc_request(method, params, **kwargs):
+        assert method == "author_submitExtrinsic"
+        raise SubstrateRequestException(
+            "Submitted transaction is already in the pool: Transaction Already Imported"
+        )
+
+    substrate.rpc_request = rpc_request
+    receipt = await substrate.submit_extrinsic(_fake_extrinsic())
+    assert receipt.extrinsic_hash == _EXT_HASH
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_submit_still_raises_real_errors():
+    """Only the already-imported outcome is translated; genuine submission failures must propagate."""
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+
+    async def rpc_request(method, params, **kwargs):
+        raise SubstrateRequestException(
+            "Invalid Transaction: Inability to pay some fees"
+        )
+
+    substrate.rpc_request = rpc_request
+    with pytest.raises(SubstrateRequestException, match="Inability to pay"):
+        await substrate.submit_extrinsic(_fake_extrinsic())
