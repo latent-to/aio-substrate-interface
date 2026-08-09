@@ -8,8 +8,9 @@ correctness cross-checks passed: storage keys byte-identical, decoded values
 identical, full-map sizes equal.
 
 Versions: asi working tree after `e1648a8` (C batch keybuild, websocket
-recv-path rework), cyscale 0.8.0 working tree after `0bc0266` (one-shot C
-BLAKE2b, limb base58, `blake2_128_concat_batch`), bittensor 11.0.2.
+recv-path rework, per-request-future response wait), cyscale 0.8.0 working
+tree after `0bc0266` (one-shot C BLAKE2b, limb base58,
+`blake2_128_concat_batch`, parametrized-type class cache), bittensor 11.0.2.
 
 ## Linux x86_64 — localhost archive node
 
@@ -22,51 +23,57 @@ seconds and would otherwise be charged to whichever library runs first.
 
 ### Standard asyncio loop
 
+Known infra artifact: the "30 concurrent queries" phase stalls ~40ms for
+both libraries on this host. Packet captures show it is the Docker
+userland-proxy leg (containerized node's Nagle vs the proxy's delayed ACK),
+not client behavior; `"userland-proxy": false` or `--network host` on the
+node removes it.
+
 ```
 ==== E2E summary (median, asi vs v11) ====
-  query_batch 10k accounts                 asi=    112.4ms  v11=    116.2ms  ratio=0.97x
-  get_block                                asi=      1.5ms  v11=      1.1ms  ratio=1.40x
-  single query (System.Account)            asi=      0.7ms  v11=      0.6ms  ratio=1.29x
-  30 sequential queries (Tempo)            asi=     21.5ms  v11=     15.9ms  ratio=1.35x
-  30 concurrent queries (gather)           asi=     48.0ms  v11=     44.9ms  ratio=1.07x
-  runtime_call (current_alpha_price)       asi=      1.2ms  v11=      0.9ms  ratio=1.28x
-  get_events                               asi=      1.8ms  v11=      2.4ms  ratio=0.73x
-  query_map one subnet (Keys, page=100)    asi=     12.1ms  v11=      9.3ms  ratio=1.30x
-  query_map full (Keys, idiomatic modes)   asi=    380.7ms  v11=   1110.2ms  ratio=0.34x
+  query_batch 10k accounts                 asi=    119.5ms  v11=    130.7ms  ratio=0.91x
+  get_block                                asi=      1.8ms  v11=      1.2ms  ratio=1.46x
+  single query (System.Account)            asi=      0.9ms  v11=      0.6ms  ratio=1.33x
+  30 sequential queries (Tempo)            asi=     24.2ms  v11=     20.1ms  ratio=1.20x
+  30 concurrent queries (gather)           asi=     45.8ms  v11=     43.4ms  ratio=1.05x
+  runtime_call (current_alpha_price)       asi=      1.0ms  v11=      0.7ms  ratio=1.39x
+  get_events                               asi=      1.2ms  v11=      1.5ms  ratio=0.82x
+  query_map one subnet (Keys, page=100)    asi=     10.3ms  v11=      8.6ms  ratio=1.20x
+  query_map full (Keys, idiomatic modes)   asi=    359.5ms  v11=   1205.6ms  ratio=0.30x
 
 ==== CPU summary (median, asi vs v11) ====
-  keybuild 10k                             asi=      5.9ms  v11=     11.8ms  ratio=0.50x
-  decode 10k accounts                      asi=     12.5ms  v11=     25.7ms  ratio=0.49x
-  map page System.Account                  asi=      4.2ms  v11=      4.9ms  ratio=0.86x
-  map page SubtensorModule.Keys            asi=      1.6ms  v11=      2.0ms  ratio=0.79x
-  map page SubtensorModule.Bonds           asi=      1.8ms  v11=      2.6ms  ratio=0.70x
+  keybuild 10k                             asi=      5.5ms  v11=     11.7ms  ratio=0.47x
+  decode 10k accounts                      asi=     11.0ms  v11=     26.8ms  ratio=0.41x
+  map page System.Account                  asi=      2.5ms  v11=      3.1ms  ratio=0.78x
+  map page SubtensorModule.Keys            asi=      1.5ms  v11=      2.4ms  ratio=0.63x
+  map page SubtensorModule.Bonds           asi=      1.1ms  v11=      1.5ms  ratio=0.74x
 ```
 
 ### uvloop (`UVLOOP=1`)
 
 Both libraries run on the same loop, so this is the whole stack under
-uvloop, not an asi-only change. The standout is concurrent multiplexed
-calls: 30 gathered queries drop from ~48ms to ~5ms for asi while v11 stays
-at ~43ms. Everything else is within run-to-run noise of the table above.
+uvloop, not an asi-only change. uvloop's tighter write segmentation happens
+to dodge the Docker-proxy stall above: asi's 30 gathered queries drop to
+~5ms while v11 stays at ~44ms. Everything else is within run-to-run noise.
 
 ```
 ==== E2E summary (median, asi vs v11) ====
-  query_batch 10k accounts                 asi=    100.9ms  v11=    100.5ms  ratio=1.00x
-  get_block                                asi=      2.1ms  v11=      1.5ms  ratio=1.39x
-  single query (System.Account)            asi=      1.0ms  v11=      0.8ms  ratio=1.32x
-  30 sequential queries (Tempo)            asi=     21.1ms  v11=     16.0ms  ratio=1.32x
-  30 concurrent queries (gather)           asi=      5.1ms  v11=     43.0ms  ratio=0.12x
-  runtime_call (current_alpha_price)       asi=      0.9ms  v11=      0.7ms  ratio=1.29x
-  get_events                               asi=      1.2ms  v11=      1.6ms  ratio=0.77x
-  query_map one subnet (Keys, page=100)    asi=     11.2ms  v11=      9.7ms  ratio=1.15x
-  query_map full (Keys, idiomatic modes)   asi=    413.9ms  v11=   1179.9ms  ratio=0.35x
+  query_batch 10k accounts                 asi=    103.0ms  v11=    110.8ms  ratio=0.93x
+  get_block                                asi=      1.4ms  v11=      1.1ms  ratio=1.29x
+  single query (System.Account)            asi=      0.7ms  v11=      0.6ms  ratio=1.22x
+  30 sequential queries (Tempo)            asi=     21.9ms  v11=     17.8ms  ratio=1.23x
+  30 concurrent queries (gather)           asi=      4.9ms  v11=     43.7ms  ratio=0.11x
+  runtime_call (current_alpha_price)       asi=      1.0ms  v11=      0.8ms  ratio=1.13x
+  get_events                               asi=      1.2ms  v11=      1.7ms  ratio=0.71x
+  query_map one subnet (Keys, page=100)    asi=      8.1ms  v11=      7.0ms  ratio=1.14x
+  query_map full (Keys, idiomatic modes)   asi=    399.8ms  v11=   1046.9ms  ratio=0.38x
 
 ==== CPU summary (median, asi vs v11) ====
-  keybuild 10k                             asi=      5.9ms  v11=     11.5ms  ratio=0.51x
-  decode 10k accounts                      asi=     11.9ms  v11=     23.5ms  ratio=0.51x
+  keybuild 10k                             asi=      5.6ms  v11=     12.3ms  ratio=0.46x
+  decode 10k accounts                      asi=     12.4ms  v11=     22.6ms  ratio=0.55x
   map page System.Account                  asi=      1.8ms  v11=      3.2ms  ratio=0.58x
-  map page SubtensorModule.Keys            asi=      1.6ms  v11=      2.0ms  ratio=0.78x
-  map page SubtensorModule.Bonds           asi=      1.1ms  v11=      1.6ms  ratio=0.68x
+  map page SubtensorModule.Keys            asi=      2.0ms  v11=      2.0ms  ratio=0.96x
+  map page SubtensorModule.Bonds           asi=      1.4ms  v11=      2.0ms  ratio=0.68x
 ```
 
 ## macOS — WAN archive endpoint
@@ -80,24 +87,24 @@ full-map ratio is dominated by RPC strategy: v11 walks the 30k-entry map in
 phases feed identical raw RPC data to both codecs and are stable, except
 that phases timed while the v11 tokio runtime idles in-process (notably the
 Keys map page) read higher than standalone measurements (0.9ms standalone
-vs 1.7ms here).
+vs ~1.7ms here).
 
 ```
 ==== E2E summary (median, asi vs v11) ====
-  query_batch 10k accounts                 asi=   4573.7ms  v11=   6761.2ms  ratio=0.68x
-  get_block                                asi=    258.3ms  v11=    267.7ms  ratio=0.96x
-  single query (System.Account)            asi=    258.4ms  v11=    254.8ms  ratio=1.01x
-  30 sequential queries (Tempo)            asi=   8520.9ms  v11=   7662.2ms  ratio=1.11x
-  30 concurrent queries (gather)           asi=    319.4ms  v11=    294.7ms  ratio=1.08x
-  runtime_call (current_alpha_price)       asi=    253.1ms  v11=    256.3ms  ratio=0.99x
-  get_events                               asi=    263.5ms  v11=    261.3ms  ratio=1.01x
-  query_map one subnet (Keys, page=100)    asi=   1575.5ms  v11=   1583.1ms  ratio=1.00x
-  query_map full (Keys, idiomatic modes)   asi=  10149.2ms  v11= 188293.5ms  ratio=0.05x
+  query_batch 10k accounts                 asi=   4545.0ms  v11=   5161.0ms  ratio=0.88x
+  get_block                                asi=    256.4ms  v11=    264.8ms  ratio=0.97x
+  single query (System.Account)            asi=    261.6ms  v11=    258.8ms  ratio=1.01x
+  30 sequential queries (Tempo)            asi=   8924.7ms  v11=   7997.2ms  ratio=1.12x
+  30 concurrent queries (gather)           asi=    297.2ms  v11=    297.1ms  ratio=1.00x
+  runtime_call (current_alpha_price)       asi=    542.4ms  v11=   3285.6ms  ratio=0.17x
+  get_events                               asi=    263.7ms  v11=    278.0ms  ratio=0.95x
+  query_map one subnet (Keys, page=100)    asi=   1567.1ms  v11=   2115.2ms  ratio=0.74x
+  query_map full (Keys, idiomatic modes)   asi=  10009.5ms  v11= 208676.9ms  ratio=0.05x
 
 ==== CPU summary (median, asi vs v11) ====
-  keybuild 10k                             asi=      3.8ms  v11=      8.5ms  ratio=0.45x
-  decode 10k accounts                      asi=      5.5ms  v11=     13.6ms  ratio=0.41x
-  map page System.Account                  asi=      1.1ms  v11=      1.9ms  ratio=0.56x
-  map page SubtensorModule.Keys            asi=      1.7ms  v11=      0.9ms  ratio=1.88x
-  map page SubtensorModule.Bonds           asi=      1.4ms  v11=      1.2ms  ratio=1.09x
+  keybuild 10k                             asi=      4.0ms  v11=      8.5ms  ratio=0.47x
+  decode 10k accounts                      asi=      5.7ms  v11=     13.1ms  ratio=0.43x
+  map page System.Account                  asi=      2.2ms  v11=      1.9ms  ratio=1.13x
+  map page SubtensorModule.Keys            asi=      1.7ms  v11=      1.2ms  ratio=1.48x
+  map page SubtensorModule.Bonds           asi=      1.0ms  v11=      1.0ms  ratio=0.91x
 ```

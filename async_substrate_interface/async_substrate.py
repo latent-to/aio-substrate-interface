@@ -1549,6 +1549,41 @@ class Websocket:
                     raise e
         return None
 
+    async def wait_for_response(self, item_id: str) -> Optional[dict]:
+        """
+        Await and consume the response for a single in-flight request id.
+
+        Unlike the `arm_response_event`/`retrieve`/`wait_response_event`
+        polling cycle, this awaits the request's own future, so each caller
+        wakes exactly when its own response arrives: concurrent callers
+        cannot consume or delay each other's wakeups through the shared
+        response event. The handler task is watched alongside the future, so
+        a handler that dies before the response arrives surfaces its stored
+        error (via the same triage as `retrieve`) instead of hanging.
+
+        Only valid for plain request ids (not subscription ids). Returns the
+        response dict, or None if the id is unknown.
+        """
+        fut = self._received.get(item_id)
+        while fut is not None and not fut.done():
+            handler = self._send_recv_task
+            if handler is not None and not handler.done():
+                # Neither is cancelled by asyncio.wait on exit.
+                await asyncio.wait({fut, handler}, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Handler dead or absent: `retrieve` raises its stored error.
+                # If it stored none (graceful close with our request still
+                # pending), fall back to a slow poll — a subsequent request
+                # revives the handler, which resends in-flight payloads, and
+                # this then completes normally (mirrors the polling loop).
+                maybe = await self.retrieve(item_id)
+                if maybe is not None:
+                    return maybe
+                await asyncio.wait({fut}, timeout=0.1)
+        # Consume through retrieve for the usual bookkeeping (semaphore
+        # release, cleanup) and error propagation.
+        return await self.retrieve(item_id)
+
     async def discard_request(self, item_id: str) -> None:
         """
         Drop a request that never completed and release the subscription permit that `send` acquired for it.
@@ -3072,6 +3107,30 @@ class AsyncSubstrateInterface(SubstrateMixin):
                         logger.debug(
                             f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
                         )
+
+                if len(payloads) == 1 and result_handler is None:
+                    # Single plain request (the shape of query/rpc_request/
+                    # runtime_call): await this request's own future instead
+                    # of the shared-event scan loop below. With N concurrent
+                    # callers the shared event degrades badly — every arm()
+                    # clears a wakeup some other caller may still need.
+                    response = await ws.wait_for_response(item_id)
+                    if response is None:
+                        raise SubstrateRequestException(
+                            f"No response for request {item_id}"
+                        )
+                    decoded_response, complete = await self._process_response(
+                        response,
+                        item_id,
+                        value_scale_type,
+                        storage_item,
+                        result_handler,
+                        runtime=runtime,
+                    )
+                    if result_processor is not None:
+                        decoded_response = result_processor(decoded_response, item_id)
+                    request_manager.add_response(item_id, decoded_response, complete)
+                    return request_manager.get_results()
 
                 while True:
                     ws.arm_response_event()
