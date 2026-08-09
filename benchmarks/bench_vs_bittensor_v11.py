@@ -30,6 +30,8 @@ URL = os.getenv("RPC_ENDPOINT", "wss://archive.sub.latent.to")
 # The full query_map scenario costs v11 two RPCs per 100 entries (~3min for a
 # 30k-entry map over WAN; seconds against a local node). Disable with FULL_MAPS=0.
 FULL_MAPS = os.getenv("FULL_MAPS", "1") == "1"
+# UVLOOP=1: run under uvloop instead of the standard asyncio loop (see bottom).
+
 N_ACCOUNTS = 10_000
 REPEATS = 5
 SCRATCH = "/tmp"
@@ -581,4 +583,12 @@ async def main():
                 )
 
 
-asyncio.run(main())
+# UVLOOP=1 runs the whole comparison under uvloop. Both libraries share the
+# loop, so this measures the stack's behavior under the recommended loop, not
+# an asi-only advantage.
+if os.getenv("UVLOOP", "0") == "1":
+    import uvloop
+
+    uvloop.run(main())
+else:
+    asyncio.run(main())

@@ -51,6 +51,26 @@ async def main():
 asyncio.run(main())
 ```
 
+### Event loop: uvloop recommended
+
+The library works on the standard asyncio event loop, but we recommend running your
+application under [uvloop](https://github.com/MagicStack/uvloop) when it is available
+for your platform:
+
+```bash
+pip install uvloop
+```
+
+```python
+import uvloop
+
+uvloop.run(main())  # instead of asyncio.run(main())
+```
+
+In our benchmarks against a local node (`benchmarks/BENCHMARKS.md`), uvloop made
+concurrent multiplexed calls (many `asyncio.gather`-ed queries over the single
+websocket connection) dramatically faster, and was at worst neutral everywhere else.
+
 ### Caching
 
 Caching is used to improve the overall performance of this library. It is applied only on methods whose results
