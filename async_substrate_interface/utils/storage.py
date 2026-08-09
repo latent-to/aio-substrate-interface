@@ -14,11 +14,11 @@ from async_substrate_interface.utils.hasher import (
     identity,
 )
 
-try:
-    from typing import Self
-except ImportError:
-    # fallback to typing_extensions if Python < 3.11
-    from typing_extensions import Self
+from typing import Self
+
+# Whole-batch storage-key hashing (hex parse + BLAKE2b + concat per key in
+# one C loop).
+from scalecodec.utils._ss58 import blake2_128_concat_batch
 
 # Single source of truth mapping a metadata hasher name to its implementation.
 # `None`/empty hasher defaults to "Twox128" (matches substrate behaviour).
@@ -58,12 +58,18 @@ class StorageKey:
     def params_encoded(self) -> list[Any]:
         """Encoded params as ``ScaleBytes``, one per param.
 
-        The batch builder stores raw ``bytes`` for byte-transparent params;
-        they are wrapped in ``ScaleBytes`` lazily on first access.
+        The batch builder stores raw ``bytes`` (or the source ``"0x..."`` hex
+        strings) for byte-transparent params; they are wrapped in
+        ``ScaleBytes`` lazily on first access.
         """
         pe = self._params_encoded
-        if any(type(x) is bytes for x in pe):
-            pe = [x if type(x) is not bytes else ScaleBytes(x) for x in pe]
+        if any(type(x) in (bytes, str) for x in pe):
+            pe = [
+                ScaleBytes(x)
+                if type(x) is bytes
+                else (ScaleBytes(bytes.fromhex(x[2:])) if type(x) is str else x)
+                for x in pe
+            ]
             self._params_encoded = pe
         return pe
 
@@ -152,12 +158,19 @@ class StorageKey:
         """
         Everything that is constant per storage function, resolved once and
         cached on the metadata object: ``(metadata_storage_function,
-        value_scale_type, param_types, hasher_fns, prefix, scale_objects)``.
+        value_scale_type, param_types, hasher_fns, prefix, scale_objects,
+        batch_cls)``.
 
         Metadata resolution (pallet scan, storage-entry scan), the pallet/item
         prefix hash, and the param encoder objects dominate single storage-key
         construction; caching them makes per-key work just the param encode +
         param hash.
+
+        ``batch_cls`` is a StorageKey subclass whose batch-constant attributes
+        (pallet, storage function, metadata, runtime config, value scale type,
+        metadata storage function) are plain class attributes shadowing the
+        base slots, so batch construction only writes the three per-key slots
+        (``params``, ``data``, ``_params_encoded``).
 
         Raises StorageFunctionNotFound when the pallet or storage function
         does not exist.
@@ -203,6 +216,20 @@ class StorageKey:
             except KeyError:
                 raise ValueError('Unknown storage hasher "{}"'.format(param_hasher))
 
+        batch_cls = type(
+            f"_Batch_{pallet}_{storage_function}",
+            (cls,),
+            {
+                "__slots__": (),
+                "pallet": pallet,
+                "storage_function": storage_function,
+                "metadata": metadata,
+                "runtime_config": runtime_config,
+                "value_scale_type": value_scale_type,
+                "metadata_storage_function": metadata_storage_function,
+            },
+        )
+
         prep = (
             metadata_storage_function,
             value_scale_type,
@@ -210,6 +237,7 @@ class StorageKey:
             hasher_fns,
             prefix,
             scale_objects,
+            batch_cls,
         )
         cache[key] = prep
         return prep
@@ -243,6 +271,7 @@ class StorageKey:
             hasher_fns,
             prefix,
             scale_objects,
+            _,
         ) = cls.prepared(pallet, storage_function, runtime_config, metadata)
 
         ss58_format = runtime_config.ss58_format
@@ -317,9 +346,57 @@ class StorageKey:
             hasher_fns,
             prefix,
             scale_objects,
+            batch_cls,
         ) = cls.prepared(pallet, storage_function, runtime_config, metadata)
 
         ss58_format = runtime_config.ss58_format
+
+        # C fast path for the dominant shape: a single Blake2_128Concat
+        # parameter passed as "0x..." hex (or raw bytes) whose SCALE encoding
+        # is byte-transparent (AccountId, H256, ...). One representative param
+        # is round-tripped through the real encoder to prove transparency and
+        # fix the raw length; the whole batch is then hashed in one C call.
+        # Any nonconforming entry (ss58 string, wrong length, int, ScaleBytes)
+        # raises ValueError and the batch falls back to the generic loop.
+        if (
+            len(param_types) == 1
+            and hasher_fns[0] is blake2_128_concat
+            and params_list
+            and len(params_list[0]) == 1
+        ):
+            probe = params_list[0][0]
+            if type(probe) is str and probe[:2] == "0x":
+                encoded0 = scale_objects[0].encode(
+                    cls._convert_storage_parameter(param_types[0], probe, ss58_format)
+                )
+                enc_bytes = bytes(encoded0.data)
+                if (
+                    len(probe) == 2 + 2 * len(enc_bytes)
+                    and bytes.fromhex(probe[2:]) == enc_bytes
+                ):
+                    try:
+                        simple_params = [p[0] for p in params_list if len(p) == 1]
+                        if len(simple_params) != len(params_list):
+                            key_datas = None
+                        else:
+                            key_datas = blake2_128_concat_batch(
+                                prefix, simple_params, len(enc_bytes)
+                            )
+                    except ValueError:
+                        key_datas = None
+                    if key_datas is not None:
+                        new_ = batch_cls.__new__
+                        storage_keys_: list[Self] = []
+                        append_ = storage_keys_.append
+                        for params, data in zip(params_list, key_datas):
+                            obj = new_(batch_cls)
+                            obj.params = params
+                            obj.data = data
+                            # hex str / bytes params; the params_encoded
+                            # property wraps them into ScaleBytes lazily.
+                            obj._params_encoded = params
+                            append_(obj)
+                        return storage_keys_
 
         # Per-position identity-encode probe: many storage params (AccountId,
         # H256, [u8; N]) are passed as "0x..." hex strings (or raw bytes) whose
@@ -333,7 +410,7 @@ class StorageKey:
         identity_raw_len: list[Optional[int]] = [None] * len(param_types)
 
         convert = cls._convert_storage_parameter
-        new = cls.__new__
+        new = batch_cls.__new__
         storage_keys: list[Self] = []
         append = storage_keys.append
         for params in params_list:
@@ -382,17 +459,13 @@ class StorageKey:
                 params_encoded.append(encoded)
                 storage_hash += hasher_fns[idx](params_key)
 
-            storage_key_obj = new(cls)
-            storage_key_obj.pallet = pallet
-            storage_key_obj.storage_function = storage_function
+            # Only the per-key slots are written; the batch-constant
+            # attributes live on batch_cls as class attributes.
+            storage_key_obj = new(batch_cls)
             storage_key_obj.params = params
             storage_key_obj._params_encoded = params_encoded
             # Mirror generate(): the hash is assigned onto self.data directly.
             storage_key_obj.data = storage_hash
-            storage_key_obj.metadata = metadata
-            storage_key_obj.runtime_config = runtime_config
-            storage_key_obj.value_scale_type = value_scale_type
-            storage_key_obj.metadata_storage_function = metadata_storage_function
             append(storage_key_obj)
 
         return storage_keys

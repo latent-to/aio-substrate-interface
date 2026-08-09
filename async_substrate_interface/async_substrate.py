@@ -645,8 +645,11 @@ class Websocket:
         self._log_raw_websockets = _log_raw_websockets
         self._in_use_ids: set[str] = set()
         self._max_retries = max_retries
-        self._last_activity = asyncio.Event()
-        self._last_activity.set()
+        # Monotonic loop.time() of the last websocket traffic (send or recv).
+        # The receive loop enforces `retry_timeout` of inactivity against this
+        # timestamp; a plain float store per message replaces the previous
+        # Event-churn + watcher-task machinery.
+        self._last_activity_ts: float = 0.0
         # Set whenever a response, subscription message, or error is delivered;
         # consumers arm (clear) it before scanning for results and wait on it
         # instead of sleep-polling. Purely a wakeup optimization: correctness
@@ -734,62 +737,6 @@ class Websocket:
     @staticmethod
     async def loop_time() -> float:
         return asyncio.get_running_loop().time()
-
-    async def _reset_activity_timer(self):
-        """Reset the shared activity timeout"""
-        # Create a NEW event instead of reusing the same one
-        old_event = self._last_activity
-        self._last_activity = asyncio.Event()
-        self._last_activity.clear()  # Start fresh
-        old_event.set()  # Wake up anyone waiting on the old event
-
-    async def _wait_with_activity_timeout(self, coro, timeout: float):
-        """
-        Wait for a coroutine with a shared activity timeout.
-        Returns the result or raises TimeoutError if no activity for timeout seconds.
-        """
-        if isinstance(coro, asyncio.Task):
-            main_task = coro
-        else:
-            main_task = asyncio.create_task(coro)
-        activity_task = asyncio.create_task(self._last_activity.wait())
-
-        try:
-            # Looped rather than recursive: every activity event during a single wait would
-            # otherwise add a stack frame, growing without bound under send-heavy bursts.
-            while True:
-                done, pending = await asyncio.wait(
-                    [main_task, activity_task],
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                if not done:
-                    logger.debug(
-                        f"Activity timeout after {timeout}s, no activity detected"
-                    )
-                    for task in pending:
-                        task.cancel()
-                    raise TimeoutError()
-
-                if main_task in done:
-                    activity_task.cancel()
-
-                    exc = main_task.exception()
-                    if exc is not None:
-                        raise exc
-                    else:
-                        return main_task.result()
-
-                # activity fired: restart the timeout window, waiting on the fresh event
-                # installed by _reset_activity_timer
-                logger.debug("Activity detected, resetting timeout")
-                activity_task = asyncio.create_task(self._last_activity.wait())
-
-        except asyncio.CancelledError:
-            main_task.cancel()
-            activity_task.cancel()
-            raise
 
     async def _cancel(self):
         try:
@@ -1193,16 +1140,30 @@ class Websocket:
 
     async def _start_receiving(self, ws: ClientConnection) -> Optional[Exception]:
         logger.debug("Starting receiving task")
+        loop = asyncio.get_running_loop()
+        self._last_activity_ts = loop.time()
         try:
             while True:
                 try:
-                    recd = await self._wait_with_activity_timeout(
-                        ws.recv(decode=False), self.retry_timeout
-                    )
-                    await self._reset_activity_timer()
+                    # The inactivity window is enforced with a deadline against
+                    # `_last_activity_ts` rather than by wrapping the recv in
+                    # watcher tasks: this path runs once per received message,
+                    # and task creation dominated its cost. Cancelling
+                    # `ws.recv()` at the deadline is data-safe (documented by
+                    # websockets), and was already the behavior on timeout.
+                    async with asyncio.timeout_at(
+                        self._last_activity_ts + self.retry_timeout
+                    ):
+                        recd = await ws.recv(decode=False)
+                    self._last_activity_ts = loop.time()
                     self._attempts = 0
                     await self._recv(recd)
                 except TimeoutError:
+                    now = loop.time()
+                    if now < self._last_activity_ts + self.retry_timeout:
+                        # Send-side traffic advanced the window while this recv
+                        # was waiting against the older deadline; keep waiting.
+                        continue
                     if (
                         self._waiting_for_response <= 0
                         and self._sending.qsize() == 0
@@ -1210,9 +1171,10 @@ class Websocket:
                         and len(self._received_subscriptions) == 0
                     ):
                         # if there's nothing in a queue, we really have no reason to have this, so we continue to wait
+                        self._last_activity_ts = now
                         continue
                     else:
-                        raise
+                        raise TimeoutError() from None
         except websockets.exceptions.ConnectionClosedOK as e:
             logger.debug("ConnectionClosedOK")
             return e
@@ -1230,6 +1192,7 @@ class Websocket:
 
     async def _start_sending(self, ws) -> Exception:
         logger.debug("Starting sending task")
+        loop = asyncio.get_running_loop()
         to_send = None
         try:
             while True:
@@ -1250,7 +1213,7 @@ class Websocket:
                     raw_websocket_logger.debug(f"WEBSOCKET_SEND> {to_send}")
                 await ws.send(to_send)
                 logger.debug("Sent to websocket")
-                await self._reset_activity_timer()
+                self._last_activity_ts = loop.time()
         except Exception as e:
             if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception(
@@ -1531,8 +1494,12 @@ class Websocket:
         `set()` on an exotic delivery path degrades to a slow poll rather than a hang.
         """
         try:
-            await asyncio.wait_for(self._response_delivered.wait(), timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+            # asyncio.timeout schedules a timer handle in place, unlike
+            # wait_for which wraps the wait in a new Task per call — this
+            # runs once per delivered response, so that task shows up.
+            async with asyncio.timeout(timeout):
+                await self._response_delivered.wait()
+        except TimeoutError:
             pass
 
     async def retrieve(self, item_id: str) -> Optional[dict]:

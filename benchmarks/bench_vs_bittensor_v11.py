@@ -550,12 +550,16 @@ async def main():
                         "SubtensorModule", "Keys", None, block_hash
                     )
 
+                # warmup=1 matters here: the first full-map scan pays the
+                # node's cold trie walk (seconds), later ones read warm caches
+                # (hundreds of ms). With warmup=0 whichever library runs first
+                # absorbs the cold cost and the comparison is meaningless.
                 a_full, v_full = await e2e_pair(
                     "query_map full (Keys, idiomatic modes)",
                     asi_map_full,
                     v11_map_full,
                     repeats=1,
-                    warmup=0,
+                    warmup=1,
                     pause=0,
                 )
                 print(

@@ -2,47 +2,26 @@
 
 import xxhash
 
-try:
-    # cyscale >= 0.8 ships one-shot C BLAKE2b helpers (~2x faster than
-    # hashlib for the small per-storage-key inputs hashed here).
-    from scalecodec.utils._ss58 import (
-        blake2b_digest as _blake2b_digest,
-        blake2_128_concat,
-    )
+# cyscale's one-shot C BLAKE2b helpers (~2x faster than hashlib for the
+# small per-storage-key inputs hashed here).
+from scalecodec.utils._ss58 import (  # noqa: F401
+    blake2b_digest as _blake2b_digest,
+    blake2_128_concat,
+)
 
-    def blake2_256(data):
-        """
-        Helper function to calculate a 32 bytes Blake2b hash for provided data, used as key for Substrate storage items
-        """
-        return _blake2b_digest(data, 32)
 
-    def blake2_128(data):
-        """
-        Helper function to calculate a 16 bytes Blake2b hash for provided data, used as key for Substrate storage items
-        """
-        return _blake2b_digest(data, 16)
+def blake2_256(data):
+    """
+    Helper function to calculate a 32 bytes Blake2b hash for provided data, used as key for Substrate storage items
+    """
+    return _blake2b_digest(data, 32)
 
-except ImportError:
-    from hashlib import blake2b
 
-    def blake2_256(data):
-        """
-        Helper function to calculate a 32 bytes Blake2b hash for provided data, used as key for Substrate storage items
-        """
-        return blake2b(data, digest_size=32).digest()
-
-    def blake2_128(data):
-        """
-        Helper function to calculate a 16 bytes Blake2b hash for provided data, used as key for Substrate storage items
-        """
-        return blake2b(data, digest_size=16).digest()
-
-    def blake2_128_concat(data):
-        """
-        Helper function to calculate a 16 bytes Blake2b hash for provided data, concatenated with data, used as key
-        for Substrate storage items
-        """
-        return blake2b(data, digest_size=16).digest() + data
+def blake2_128(data):
+    """
+    Helper function to calculate a 16 bytes Blake2b hash for provided data, used as key for Substrate storage items
+    """
+    return _blake2b_digest(data, 16)
 
 
 def xxh128(data):
