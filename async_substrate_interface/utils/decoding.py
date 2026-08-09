@@ -1,3 +1,4 @@
+from operator import itemgetter
 from typing import TYPE_CHECKING, Optional, Any
 
 from scalecodec import ScaleBytes
@@ -106,43 +107,40 @@ def decode_query_map(
         key_type_string = f"({', '.join(key_type_string_)})"
         hash_len = None
 
-    pre_decoded_keys = []
-    pre_decoded_key_types = [key_type_string] * len(result_group_changes)
-    pre_decoded_values = []
-    pre_decoded_value_types = [value_type] * len(result_group_changes)
+    n_entries = len(result_group_changes)
+    pre_decoded_key_types = [key_type_string] * n_entries
+    pre_decoded_value_types = [value_type] * n_entries
 
-    for item in result_group_changes:
-        raw_key = bytes.fromhex(item[0][len(prefix) :])
-        pre_decoded_keys.append(raw_key[hash_len:] if hash_len else raw_key)
-        pre_decoded_values.append(
-            hex_to_bytes_(item[1]) if item[1] is not None else b""
-        )
+    key_start = len(prefix) + 2 * hash_len if hash_len else len(prefix)
+    pre_decoded_keys = [
+        bytes.fromhex(item[0][key_start:]) for item in result_group_changes
+    ]
+    pre_decoded_values = [
+        hex_to_bytes_(item[1]) if item[1] is not None else b""
+        for item in result_group_changes
+    ]
     all_decoded = _decode_scale_list_with_runtime(
         pre_decoded_key_types + pre_decoded_value_types,
         pre_decoded_keys + pre_decoded_values,
         runtime,
     )
-    result = []
     middl_index = len(all_decoded) // 2
     decoded_keys = all_decoded[:middl_index]
     decoded_values = all_decoded[middl_index:]
-    for kts, vts, dk, dv in zip(
-        pre_decoded_key_types,
-        pre_decoded_value_types,
-        decoded_keys,
-        decoded_values,
-    ):
+    if n_free_keys == 1:
+        return [list(kv) for kv in zip(decoded_keys, decoded_values)]
+    # Decoded keys are ([u8; N] hash, param, [u8; N] hash, param, ...) tuples;
+    # the params sit at the odd indices. itemgetter with multiple indices
+    # returns them as a tuple in one C call.
+    get_key_parts = itemgetter(*range(1, 2 * n_free_keys, 2))
+    result = []
+    for dk, dv in zip(decoded_keys, decoded_values):
         try:
             # strip key_hashers to use as item key
-            if len(param_types) - len(params) == 1:
+            try:
+                item_key = get_key_parts(dk)
+            except IndexError:
                 item_key = dk
-            else:
-                try:
-                    item_key = tuple(
-                        dk[i * 2 + 1] for i in range(len(param_types) - len(params))
-                    )
-                except IndexError:
-                    item_key = dk
         except Exception as _:
             if not ignore_decoding_errors:
                 raise

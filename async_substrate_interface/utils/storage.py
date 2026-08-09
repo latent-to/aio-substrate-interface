@@ -40,6 +40,37 @@ class StorageKey:
     All of Substrate's higher-level storage abstractions are built on top of this simple key-value store.
     """
 
+    __slots__ = (
+        "pallet",
+        "storage_function",
+        "params",
+        "_params_encoded",
+        "data",
+        "metadata",
+        "runtime_config",
+        "value_scale_type",
+        "metadata_storage_function",
+    )
+
+    _params_encoded: list[Any]
+
+    @property
+    def params_encoded(self) -> list[Any]:
+        """Encoded params as ``ScaleBytes``, one per param.
+
+        The batch builder stores raw ``bytes`` for byte-transparent params;
+        they are wrapped in ``ScaleBytes`` lazily on first access.
+        """
+        pe = self._params_encoded
+        if any(type(x) is bytes for x in pe):
+            pe = [x if type(x) is not bytes else ScaleBytes(x) for x in pe]
+            self._params_encoded = pe
+        return pe
+
+    @params_encoded.setter
+    def params_encoded(self, value: list[Any]) -> None:
+        self._params_encoded = value
+
     def __init__(
         self,
         pallet: Optional[str],
@@ -53,7 +84,7 @@ class StorageKey:
         self.pallet = pallet
         self.storage_function = storage_function
         self.params = params
-        self.params_encoded: list[Any] = []
+        self._params_encoded: list[Any] = []
         self.data = data
         self.metadata = metadata
         self.runtime_config = runtime_config
@@ -290,8 +321,21 @@ class StorageKey:
 
         ss58_format = runtime_config.ss58_format
 
-        # --- Per-key work only. ---
+        # Per-position identity-encode probe: many storage params (AccountId,
+        # H256, [u8; N]) are passed as "0x..." hex strings (or raw bytes) whose
+        # SCALE encoding is exactly those bytes. The first key that goes
+        # through the full encoder at a position establishes whether the type
+        # is byte-transparent (encoded bytes == the input bytes); after that,
+        # same-length inputs at that position skip the SCALE encoder entirely.
+        # Value-dependent encodings (Vec<u8> length prefix, enums, compacts)
+        # fail the probe and always take the full encoder.
+        #   None: unprobed; 0: not byte-transparent; >0: raw byte length.
+        identity_raw_len: list[Optional[int]] = [None] * len(param_types)
+
+        convert = cls._convert_storage_parameter
+        new = cls.__new__
         storage_keys: list[Self] = []
+        append = storage_keys.append
         for params in params_list:
             storage_hash = prefix
             params_encoded: list[Any] = []
@@ -301,28 +345,55 @@ class StorageKey:
                     encoded = param
                     params_key = param.data
                 else:
-                    param = cls._convert_storage_parameter(
-                        param_types[idx], param, ss58_format
-                    )
-                    encoded = scale_objects[idx].encode(param)
-                    params_key = encoded.data
+                    raw_len = identity_raw_len[idx]
+                    if raw_len:
+                        if type(param) is str:
+                            if len(param) == 2 + 2 * raw_len and param[:2] == "0x":
+                                params_key = bytes.fromhex(param[2:])
+                            else:
+                                params_key = None
+                        elif type(param) is bytes and len(param) == raw_len:
+                            params_key = param
+                        else:
+                            params_key = None
+                        if params_key is not None:
+                            # Raw bytes; the params_encoded property wraps
+                            # these in ScaleBytes lazily on access.
+                            encoded = params_key
+                        else:
+                            param = convert(param_types[idx], param, ss58_format)
+                            encoded = scale_objects[idx].encode(param)
+                            params_key = encoded.data
+                    else:
+                        param = convert(param_types[idx], param, ss58_format)
+                        encoded = scale_objects[idx].encode(param)
+                        params_key = encoded.data
+                        if raw_len is None:
+                            identity_raw_len[idx] = (
+                                len(params_key)
+                                if (
+                                    type(param) is str
+                                    and param[:2] == "0x"
+                                    and len(param) == 2 + 2 * len(params_key)
+                                    and bytes.fromhex(param[2:]) == params_key
+                                )
+                                else 0
+                            )
                 params_encoded.append(encoded)
                 storage_hash += hasher_fns[idx](params_key)
 
-            storage_key_obj = cls(
-                pallet=pallet,
-                storage_function=storage_function,
-                params=params,
-                data=None,
-                runtime_config=runtime_config,
-                metadata=metadata,
-                value_scale_type=value_scale_type,
-            )
+            storage_key_obj = new(cls)
+            storage_key_obj.pallet = pallet
+            storage_key_obj.storage_function = storage_function
+            storage_key_obj.params = params
+            storage_key_obj._params_encoded = params_encoded
             # Mirror generate(): the hash is assigned onto self.data directly.
             storage_key_obj.data = storage_hash
+            storage_key_obj.metadata = metadata
+            storage_key_obj.runtime_config = runtime_config
+            storage_key_obj.value_scale_type = value_scale_type
             storage_key_obj.metadata_storage_function = metadata_storage_function
-            storage_key_obj.params_encoded = params_encoded
-            storage_keys.append(storage_key_obj)
+            append(storage_key_obj)
 
         return storage_keys
 
