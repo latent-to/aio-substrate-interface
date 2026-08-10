@@ -32,9 +32,9 @@ async def main():
             await asi.rpc_request("bench_method", [])
             times.append(time.perf_counter() - t0)
         print(
-            f"local sequential rpc_request x300: median={statistics.median(times)*1000:7.3f}ms  "
-            f"p95={sorted(times)[int(len(times)*0.95)]*1000:7.3f}ms  "
-            f"total={sum(times)*1000:8.1f}ms"
+            f"local sequential rpc_request x300: median={statistics.median(times) * 1000:7.3f}ms  "
+            f"p95={sorted(times)[int(len(times) * 0.95)] * 1000:7.3f}ms  "
+            f"total={sum(times) * 1000:8.1f}ms"
         )
         await asi.close()
 
