@@ -88,6 +88,9 @@ class _FakePoisonWs:
     async def retrieve(self, item_id):
         raise TimeoutError("Max retries exceeded.")
 
+    async def wait_for_response(self, item_id):
+        raise TimeoutError("Max retries exceeded.")
+
     async def discard_request(self, item_id):
         self.max_subscriptions.release()
         self.permits_held -= 1

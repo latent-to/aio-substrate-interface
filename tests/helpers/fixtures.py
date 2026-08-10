@@ -163,6 +163,9 @@ class MockWebsocket:
     async def retrieve(self, item_id: str):
         return self._responses.pop(item_id, None)
 
+    async def wait_for_response(self, item_id: str):
+        return self._responses.pop(item_id, None)
+
     def arm_response_event(self):
         pass
 
