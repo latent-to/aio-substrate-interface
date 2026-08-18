@@ -13,6 +13,7 @@ import ssl
 import time
 import warnings
 from contextlib import suppress
+from functools import partial
 from unittest.mock import AsyncMock
 from hashlib import blake2b
 from typing import (
@@ -65,9 +66,7 @@ from async_substrate_interface.utils import (
     rng as random,
 )
 from async_substrate_interface.utils.cache import (
-    async_sql_lru_cache,
     cached_fetcher,
-    AsyncSqliteDB,
 )
 from async_substrate_interface.utils.decoding import (
     _determine_if_old_runtime_call,
@@ -101,6 +100,17 @@ raw_websocket_logger = logging.getLogger("raw_websocket")
 SUBSTRATE_CACHE_METHOD_SIZE = int(os.getenv("SUBSTRATE_CACHE_METHOD_SIZE", "512"))
 SUBSTRATE_RUNTIME_CACHE_SIZE = int(os.getenv("SUBSTRATE_RUNTIME_CACHE_SIZE", "16"))
 SSL_SESSION_TTL = int(os.getenv("SUBSTRATE_SSL_SESSION_TTL", "300"))
+
+# tuning for recovering extrinsic-watch subscriptions severed by a websocket reconnection
+EXTRINSIC_RECOVERY_SCAN_DEPTH = int(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_SCAN_DEPTH", "16")
+)
+EXTRINSIC_RECOVERY_TIMEOUT = float(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_TIMEOUT", "120")
+)
+EXTRINSIC_RECOVERY_POLL_INTERVAL = float(
+    os.getenv("SUBSTRATE_EXTRINSIC_RECOVERY_POLL_INTERVAL", "1")
+)
 
 
 class AsyncExtrinsicReceipt:
@@ -571,6 +581,17 @@ class _SessionResumingSSLContext(ssl.SSLContext):
         )
 
 
+# Errors that mean the connection dropped and the handler should reconnect, as opposed
+# to a fatal application error. SSL errors (e.g. unexpected EOF on a flaky TLS link) are
+# treated the same as an abnormal close.
+RECONNECT_EXCEPTIONS = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionClosed,
+    ssl.SSLError,
+)
+
+
 class Websocket:
     def __init__(
         self,
@@ -624,14 +645,32 @@ class Websocket:
         self._log_raw_websockets = _log_raw_websockets
         self._in_use_ids: set[str] = set()
         self._max_retries = max_retries
-        self._last_activity = asyncio.Event()
-        self._last_activity.set()
+        # Monotonic loop.time() of the last websocket traffic (send or recv).
+        # The receive loop enforces `retry_timeout` of inactivity against this
+        # timestamp; a plain float store per message replaces the previous
+        # Event-churn + watcher-task machinery.
+        self._last_activity_ts: float = 0.0
+        # Set whenever a response, subscription message, or error is delivered;
+        # consumers arm (clear) it before scanning for results and wait on it
+        # instead of sleep-polling. Purely a wakeup optimization: correctness
+        # never depends on it, so waits use a short fallback timeout.
+        self._response_delivered = asyncio.Event()
         self._waiting_for_response = 0
         self._ssl_context = ssl_context
         if ssl_context is not None and ws_url.startswith("wss://"):
             self._options["ssl"] = ssl_context
         self._dns_ttl = dns_ttl
         self._dns_cache: Optional[tuple[list, float]] = None
+        self._subscription_recoverers: dict[
+            str, Callable[[], Awaitable[Optional[str]]]
+        ] = {}
+        self._recovering_subscriptions: set[str] = set()
+        self._orphaned_subscriptions: set[str] = set()
+        self._recovery_tasks: set[asyncio.Task] = set()
+        # maps between the subscription ids consumers hold and the ids the server currently
+        # knows them by (these diverge when a recovery re-establishes a subscription)
+        self._sub_alias_to_original: dict[str, str] = {}
+        self._sub_original_to_alias: dict[str, str] = {}
 
     @property
     def state(self):
@@ -668,7 +707,14 @@ class Websocket:
                 # Consume the dead task's outcome so it is not later reported as an unretrieved exception.
                 task.exception()
             self._attempts = 0
+            # Same policy as the handler's reconnect path: subscriptions the dead handler left behind
+            # are re-established when they have a recoverer, and failed explicitly when they do not.
+            self._orphan_unrecoverable_subscriptions()
             await self._connect_internal(force=True)
+        if self._subscription_recoverers:
+            recovery_task = asyncio.create_task(self._recover_subscriptions())
+            self._recovery_tasks.add(recovery_task)
+            recovery_task.add_done_callback(self._recovery_tasks.discard)
 
     async def mark_waiting_for_response(self):
         """
@@ -691,56 +737,6 @@ class Websocket:
     @staticmethod
     async def loop_time() -> float:
         return asyncio.get_running_loop().time()
-
-    async def _reset_activity_timer(self):
-        """Reset the shared activity timeout"""
-        # Create a NEW event instead of reusing the same one
-        old_event = self._last_activity
-        self._last_activity = asyncio.Event()
-        self._last_activity.clear()  # Start fresh
-        old_event.set()  # Wake up anyone waiting on the old event
-
-    async def _wait_with_activity_timeout(self, coro, timeout: float):
-        """
-        Wait for a coroutine with a shared activity timeout.
-        Returns the result or raises TimeoutError if no activity for timeout seconds.
-        """
-        activity_task = asyncio.create_task(self._last_activity.wait())
-
-        if isinstance(coro, asyncio.Task):
-            main_task = coro
-        else:
-            main_task = asyncio.create_task(coro)
-
-        try:
-            done, pending = await asyncio.wait(
-                [main_task, activity_task],
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            if not done:
-                logger.debug(f"Activity timeout after {timeout}s, no activity detected")
-                for task in pending:
-                    task.cancel()
-                raise TimeoutError()
-
-            if main_task in done:
-                activity_task.cancel()
-
-                exc = main_task.exception()
-                if exc is not None:
-                    raise exc
-                else:
-                    return main_task.result()
-            else:
-                logger.debug("Activity detected, resetting timeout")
-                return await self._wait_with_activity_timeout(main_task, timeout)
-
-        except asyncio.CancelledError:
-            main_task.cancel()
-            activity_task.cancel()
-            raise
 
     async def _cancel(self):
         try:
@@ -798,16 +794,26 @@ class Websocket:
         return infos[0]
 
     async def connect(self, force=False):
-        if not force:
-            async with self._lock:
-                return await self._connect_internal(force)
-        else:
-            logger.debug("Proceeding without acquiring lock.")
+        # Always serialized on the lock: a forced (handler-driven) reconnect racing an
+        # unforced connect from `__aenter__` would otherwise create two sockets, orphaning
+        # one. Callers that already hold the lock use `_connect_internal` directly.
+        async with self._lock:
             return await self._connect_internal(force)
 
     async def _connect_internal(self, force):
         # Check state again after acquiring lock to avoid duplicate connections
         if not force and self.state in (State.OPEN, State.CONNECTING):
+            return None
+        if (
+            not force
+            and self._send_recv_task is not None
+            and not self._send_recv_task.done()
+        ):
+            # A live handler owns the connection lifecycle: it is mid-reconnect, or about to
+            # notice the drop itself. Proceeding here would `_cancel` it, aborting the
+            # reconnection and its resubmitted requests/subscription recovery. Queued sends
+            # will be flushed once the handler finishes reconnecting.
+            logger.debug("Handler alive; leaving reconnection to it.")
             return None
 
         logger.debug(f"Websocket connecting to {self.ws_url}")
@@ -832,25 +838,38 @@ class Websocket:
                     pass
             logger.debug("Attempting connection")
             loop = asyncio.get_running_loop()
-            try:
-                family, type_, proto, _, sockaddr = await self._resolve_host()
-                tcp_sock = socket.socket(family, type_, proto)
-                tcp_sock.setblocking(False)
+            # Retried in a loop rather than by re-calling `connect`: re-entering `connect`
+            # from here would deadlock on the (non-reentrant) lock already held by the
+            # non-forced path.
+            dns_attempts = 0
+            while True:
                 try:
-                    await asyncio.wait_for(
-                        loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                    family, type_, proto, _, sockaddr = await self._resolve_host()
+                    tcp_sock = socket.socket(family, type_, proto)
+                    tcp_sock.setblocking(False)
+                    try:
+                        await asyncio.wait_for(
+                            loop.sock_connect(tcp_sock, sockaddr), timeout=10.0
+                        )
+                    except Exception:
+                        tcp_sock.close()
+                        self._dns_cache = None  # invalidate on TCP failure
+                        raise
+                    connection = await asyncio.wait_for(
+                        connect(self.ws_url, sock=tcp_sock, **self._options),
+                        timeout=10.0,
                     )
-                except Exception:
-                    tcp_sock.close()
-                    self._dns_cache = None  # invalidate on TCP failure
-                    raise
-                connection = await asyncio.wait_for(
-                    connect(self.ws_url, sock=tcp_sock, **self._options), timeout=10.0
-                )
-            except socket.gaierror:
-                logger.debug("Hostname not known (this is just for testing")
-                await asyncio.sleep(10)
-                return await self.connect(force=force)
+                    break
+                except socket.gaierror:
+                    self._dns_cache = None
+                    dns_attempts += 1
+                    if dns_attempts >= self._max_retries:
+                        raise
+                    logger.warning(
+                        f"DNS resolution failed for {self.ws_url}. "
+                        f"Retrying ({dns_attempts}/{self._max_retries})."
+                    )
+                    await asyncio.sleep(10)
             logger.debug("Connection established")
             self.ws = connection
             if self._ssl_context is not None:
@@ -870,70 +889,94 @@ class Websocket:
         return None
 
     async def _handler(self, ws: ClientConnection) -> Optional[Exception]:
-        logger.debug("WS handler attached")
-        recv_task = asyncio.create_task(self._start_receiving(ws))
-        send_task = asyncio.create_task(self._start_sending(ws))
-        try:
-            done, pending = await asyncio.wait(
-                [recv_task, send_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            # Handler was cancelled, clean up child tasks
-            for task in [recv_task, send_task]:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            raise
-        loop = asyncio.get_running_loop()
-        should_reconnect = False
-        is_retry = False
-
-        for task in pending:
-            task.cancel()
+        # Iterative across reconnects rather than recursive: recursing here would grow the
+        # coroutine stack by one frame per reconnect, eventually hitting RecursionError on
+        # a long-lived flaky connection.
+        while True:
+            logger.debug("WS handler attached")
+            recv_task = asyncio.create_task(self._start_receiving(ws))
+            send_task = asyncio.create_task(self._start_sending(ws))
             try:
-                await task
+                done, pending = await asyncio.wait(
+                    [recv_task, send_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             except asyncio.CancelledError:
-                pass
+                # Handler was cancelled, clean up child tasks
+                for task in [recv_task, send_task]:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                raise
+            loop = asyncio.get_running_loop()
+            should_reconnect = False
+            reconnect_trigger = ""
 
-        for task in done:
-            task_res = task.result()
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-            # If ConnectionClosedOK, graceful shutdown - don't reconnect
-            if (
-                isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
-                and self._waiting_for_response <= 0
-            ):
-                logger.debug("Graceful shutdown detected, not reconnecting")
-                return None  # Clean exit
+            for task in done:
+                # The pump tasks return their errors, but a raise (a bug in their own except
+                # blocks) must flow through the same triage rather than crash the handler.
+                task_res = task.exception() or task.result()
 
-            # Check for timeout/connection errors that should trigger reconnect
-            if isinstance(
-                task_res, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
-                should_reconnect = True
-                logger.debug(f"Reconnection triggered by: {type(task_res).__name__}")
+                # If ConnectionClosedOK, graceful shutdown - don't reconnect
+                if (
+                    isinstance(task_res, websockets.exceptions.ConnectionClosedOK)
+                    and self._waiting_for_response <= 0
+                ):
+                    logger.debug("Graceful shutdown detected, not reconnecting")
+                    return None  # Clean exit
 
-            if isinstance(task_res, (asyncio.TimeoutError, TimeoutError)):
-                self._attempts += 1
-                is_retry = True
+                # Check for timeout/connection errors that should trigger reconnect
+                if isinstance(task_res, RECONNECT_EXCEPTIONS):
+                    should_reconnect = True
+                    reconnect_trigger = type(task_res).__name__
+                    logger.debug(f"Reconnection triggered by: {reconnect_trigger}")
 
-        if should_reconnect is True:
-            if len(self._received_subscriptions) > 0:
-                return SubstrateRequestException(
-                    "Unable to reconnect because there are currently open subscriptions."
-                )
+            if not should_reconnect:
+                # The task from `pending` was cancelled above: `.result()` on it would raise
+                # CancelledError, making the handler task itself read as cancelled — and
+                # `retrieve` deliberately ignores cancelled handlers, so consumers would then
+                # poll forever instead of receiving the real error.
+                for task in (recv_task, send_task):
+                    if task.cancelled():
+                        continue
+                    if isinstance(e := task.exception() or task.result(), Exception):
+                        return e
+                if len(self._received_subscriptions) > 0:
+                    return SubstrateRequestException(
+                        "Currently open subscriptions while disconnecting. "
+                        "Ensure these are unsubscribed from before closing in the future."
+                    )
+                return None
 
-            if is_retry:
-                if self._attempts >= self._max_retries:
-                    logger.error("Max retries exceeded.")
-                    return TimeoutError("Max retries exceeded.")
-                logger.info(
-                    f"Timeout occurred. Reconnecting. Attempt {self._attempts} of {self._max_retries}"
-                )
+            # Subscriptions cannot be resumed server-side after a reconnect. Those registered with a
+            # recoverer (e.g. extrinsic watches) are re-established after reconnecting; any others are
+            # failed explicitly so their consumers get an error on their next poll instead of a
+            # silent hang, and so the reconnect can proceed for everyone else.
+            self._orphan_unrecoverable_subscriptions()
+
+            # Every reconnect trigger — timeout or abnormal close — consumes retry budget;
+            # `_start_receiving` resets the counter as soon as traffic flows again, so the cap
+            # is only reached by consecutive failures with no successful traffic in between.
+            # Without this, a server that accepts connections and immediately closes them
+            # would be hammered in an unbounded tight loop.
+            self._attempts += 1
+            if self._attempts >= self._max_retries:
+                logger.error("Max retries exceeded.")
+                return TimeoutError("Max retries exceeded.")
+            logger.info(
+                f"Connection lost ({reconnect_trigger}). Reconnecting. "
+                f"Attempt {self._attempts} of {self._max_retries}"
+            )
 
             async with self._lock:
                 resent_batches: set[str] = set()
@@ -957,22 +1000,47 @@ class Websocket:
                         logger.debug(f"Resubmitting {parsed['id']}")
                         await self._sending.put(parsed)
 
+            if self._attempts > 1:
+                # repeated failures without any successful traffic in between: back off
+                backoff = min(2 ** (self._attempts - 1), 30)
+                logger.debug(f"Backing off {backoff}s before reconnecting")
+                await asyncio.sleep(backoff)
             logger.debug("Attempting reconnection...")
-            await self.connect(True)
+            while True:
+                try:
+                    await self.connect(True)
+                    break
+                except (
+                    OSError,
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    websockets.exceptions.InvalidHandshake,
+                ) as connect_error:
+                    # The endpoint may be briefly unreachable at exactly the moment we try to
+                    # reconnect; that must consume retry budget, not kill the handler (which
+                    # would strand every resubmitted in-flight request).
+                    self._attempts += 1
+                    if self._attempts >= self._max_retries:
+                        logger.error(
+                            f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                            f"Max retries exceeded."
+                        )
+                        return connect_error
+                    delay = min(2**self._attempts, 30)
+                    logger.warning(
+                        f"Reconnection to {self.ws_url} failed: {connect_error}. "
+                        f"Retrying in {delay}s. Attempt {self._attempts} of {self._max_retries}."
+                    )
+                    await asyncio.sleep(delay)
             logger.debug(f"Reconnected. Send queue size: {self._sending.qsize()}")
-            # Recursively call handler
+            if self._subscription_recoverers:
+                # Run recovery concurrently with the next handler iteration: the recoverers make
+                # RPC requests over this websocket, which need the send/recv tasks to be running.
+                recovery_task = asyncio.create_task(self._recover_subscriptions())
+                self._recovery_tasks.add(recovery_task)
+                recovery_task.add_done_callback(self._recovery_tasks.discard)
             assert self.ws is not None
-            return await self._handler(self.ws)
-        elif isinstance(e := recv_task.result(), Exception):
-            return e
-        elif isinstance(e := send_task.result(), Exception):
-            return e
-        elif len(self._received_subscriptions) > 0:
-            return SubstrateRequestException(
-                "Currently open subscriptions while disconnecting. "
-                "Ensure these are unsubscribed from before closing in the future."
-            )
-        return None
+            ws = self.ws
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.shutdown_timer is not None:
@@ -990,7 +1058,10 @@ class Websocket:
                         pass
                 if self.ws is not None:
                     self._exit_task = asyncio.create_task(self._exit_with_timer())
-        self._attempts = 0
+        # NOTE: `_attempts` is deliberately not reset here. It is reset by `_start_receiving`
+        # on successful traffic and by `_restart_handler_if_dead` when reviving a dead handler;
+        # resetting it on every context exit would let concurrent requests wipe the shared retry
+        # counter mid-reconnect, making `max_retries` unreachable under load.
 
     async def _exit_with_timer(self):
         """
@@ -1054,26 +1125,45 @@ class Websocket:
             if self._received.get(response["id"]) is not None:
                 self._received[response["id"]].set_result(response)
             self._in_use_ids.discard(response["id"])
+            self._response_delivered.set()
         elif "params" in response:
             sub_id = response["params"]["subscription"]
+            # a recovered subscription's messages arrive under its new server-side id, but its
+            # consumer still polls the original id
+            sub_id = self._sub_alias_to_original.get(sub_id, sub_id)
             if sub_id not in self._received_subscriptions:
                 self._received_subscriptions[sub_id] = asyncio.Queue()
             await self._received_subscriptions[sub_id].put(response)
+            self._response_delivered.set()
         else:
             raise KeyError(response)
 
     async def _start_receiving(self, ws: ClientConnection) -> Optional[Exception]:
         logger.debug("Starting receiving task")
+        loop = asyncio.get_running_loop()
+        self._last_activity_ts = loop.time()
         try:
             while True:
                 try:
-                    recd = await self._wait_with_activity_timeout(
-                        ws.recv(decode=False), self.retry_timeout
-                    )
-                    await self._reset_activity_timer()
+                    # The inactivity window is enforced with a deadline against
+                    # `_last_activity_ts` rather than by wrapping the recv in
+                    # watcher tasks: this path runs once per received message,
+                    # and task creation dominated its cost. Cancelling
+                    # `ws.recv()` at the deadline is data-safe (documented by
+                    # websockets), and was already the behavior on timeout.
+                    async with asyncio.timeout_at(
+                        self._last_activity_ts + self.retry_timeout
+                    ):
+                        recd = await ws.recv(decode=False)
+                    self._last_activity_ts = loop.time()
                     self._attempts = 0
                     await self._recv(recd)
                 except TimeoutError:
+                    now = loop.time()
+                    if now < self._last_activity_ts + self.retry_timeout:
+                        # Send-side traffic advanced the window while this recv
+                        # was waiting against the older deadline; keep waiting.
+                        continue
                     if (
                         self._waiting_for_response <= 0
                         and self._sending.qsize() == 0
@@ -1081,29 +1171,28 @@ class Websocket:
                         and len(self._received_subscriptions) == 0
                     ):
                         # if there's nothing in a queue, we really have no reason to have this, so we continue to wait
+                        self._last_activity_ts = now
                         continue
                     else:
-                        raise
+                        raise TimeoutError() from None
         except websockets.exceptions.ConnectionClosedOK as e:
             logger.debug("ConnectionClosedOK")
             return e
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception("Websocket receiving exception", exc_info=e)
                 for fut in self._received.values():
                     if not fut.done():
                         fut.set_exception(e)
                         fut.cancel()
+                self._response_delivered.set()
             else:
                 logger.debug("Timeout/ConnectionClosed occurred.")
             return e
 
     async def _start_sending(self, ws) -> Exception:
         logger.debug("Starting sending task")
+        loop = asyncio.get_running_loop()
         to_send = None
         try:
             while True:
@@ -1124,13 +1213,9 @@ class Websocket:
                     raw_websocket_logger.debug(f"WEBSOCKET_SEND> {to_send}")
                 await ws.send(to_send)
                 logger.debug("Sent to websocket")
-                await self._reset_activity_timer()
+                self._last_activity_ts = loop.time()
         except Exception as e:
-            if isinstance(e, ssl.SSLError):
-                e = ConnectionClosed  # type: ignore[assignment]
-            if not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionClosed)
-            ):
+            if not isinstance(e, RECONNECT_EXCEPTIONS):
                 logger.exception(
                     f"Websocket sending exception; "
                     f"sending: {self._sending.qsize()}; "
@@ -1150,6 +1235,7 @@ class Websocket:
                     for i in self._received.keys():
                         self._received[i].set_exception(e)
                         self._received[i].cancel()
+                self._response_delivered.set()
             elif isinstance(e, websockets.exceptions.ConnectionClosedOK):
                 logger.debug("Websocket connection closed.")
             else:
@@ -1229,14 +1315,192 @@ class Websocket:
                 original_id = get_next_id()
             logger.debug(f"Unwatched extrinsic subscription {subscription_id}")
             self._received_subscriptions.pop(subscription_id, None)
+            self._subscription_recoverers.pop(subscription_id, None)
+            self._orphaned_subscriptions.discard(subscription_id)
+            # a recovered subscription is known to the server by its aliased id
+            server_subscription_id = self._sub_original_to_alias.pop(
+                subscription_id, subscription_id
+            )
+            self._sub_alias_to_original.pop(server_subscription_id, None)
 
         to_send = {
             "jsonrpc": "2.0",
             "id": original_id,
             "method": method,
-            "params": [subscription_id],
+            "params": [server_subscription_id],
         }
         await self._sending.put(to_send)
+
+    def register_subscription_recoverer(
+        self,
+        subscription_id: str,
+        recoverer: Callable[[], Awaitable[Optional[str]]],
+    ) -> None:
+        """
+        Registers a coroutine function used to recover `subscription_id` if the connection is lost while
+        the subscription is open.
+
+        Server-side subscription state does not survive a reconnection, so without a recoverer an open
+        subscription is failed on reconnect: its consumer's next `retrieve` raises. With a recoverer, the
+        subscription is re-established after reconnecting. The recoverer must either:
+
+        - return a new server-side subscription id (from re-establishing the subscription), which is then
+          aliased to `subscription_id` so the consumer polling the original id keeps receiving messages
+          transparently;
+        - return None after having settled the subscription itself (typically by injecting terminal
+          messages with `inject_subscription_message`); or
+        - raise, in which case a message whose result is `{"recoveryFailed": <error>}` is injected for the
+          consumer to handle.
+
+        Args:
+            subscription_id: id of the subscription, as returned by the subscribe RPC call
+            recoverer: no-argument coroutine function implementing the contract above
+        """
+        if subscription_id not in self._received_subscriptions:
+            # ensure the subscription is tracked (keeping the connection open, and marking it as
+            # recoverable during reconnection) even before its first notification arrives
+            self._received_subscriptions[subscription_id] = asyncio.Queue()
+        self._subscription_recoverers[subscription_id] = recoverer
+
+    async def inject_subscription_message(
+        self, subscription_id: str, message: dict
+    ) -> None:
+        """
+        Puts a message on the queue of an open subscription, as though it had been received from the
+        server. Used by subscription recoverers to settle subscriptions they have resolved out-of-band.
+        Messages for subscriptions that are no longer open are dropped.
+
+        Args:
+            subscription_id: id of the subscription whose consumer should receive the message
+            message: the message dict, shaped like a subscription notification
+        """
+        queue = self._received_subscriptions.get(subscription_id)
+        if queue is None:
+            # already unsubscribed — recreating the queue here would orphan it, keeping the
+            # connection open and blocking future reconnects forever
+            logger.debug(
+                f"Dropping injected message for closed subscription {subscription_id}"
+            )
+            return
+        await queue.put(message)
+        self._response_delivered.set()
+
+    def _orphan_unrecoverable_subscriptions(self) -> list[str]:
+        """
+        Fails every open subscription that has no recoverer (and is not mid-recovery from an earlier
+        reconnection): server-side subscription state does not survive a reconnect, so these can never
+        produce another message. Each is dropped from the open set — so it cannot hold the connection
+        open or linger across reconnects — and marked orphaned, making its consumer's next `retrieve`
+        raise instead of polling an abandoned queue forever.
+
+        Returns the orphaned subscription ids.
+        """
+        orphaned = [
+            sub_id
+            for sub_id in self._received_subscriptions
+            if sub_id not in self._subscription_recoverers
+            and sub_id not in self._recovering_subscriptions
+        ]
+        for sub_id in orphaned:
+            del self._received_subscriptions[sub_id]
+            self._orphaned_subscriptions.add(sub_id)
+        if orphaned:
+            self._response_delivered.set()
+            logger.error(
+                f"Open subscriptions with no recovery handler cannot survive a reconnection "
+                f"and have been dropped: {orphaned}"
+            )
+        return orphaned
+
+    async def _recover_subscriptions(self) -> None:
+        """
+        Runs the registered recoverer for every open recoverable subscription following a reconnection.
+        See `register_subscription_recoverer` for the recoverer contract.
+        """
+        to_recover = []
+        for sub_id, recoverer in list(self._subscription_recoverers.items()):
+            if sub_id in self._recovering_subscriptions:
+                # still being recovered from a previous reconnection
+                continue
+            # claimed synchronously, so overlapping recovery runs cannot double-recover
+            self._recovering_subscriptions.add(sub_id)
+            to_recover.append((sub_id, recoverer))
+        await asyncio.gather(
+            *(
+                self._recover_subscription(sub_id, recoverer)
+                for sub_id, recoverer in to_recover
+            )
+        )
+
+    async def _recover_subscription(
+        self,
+        subscription_id: str,
+        recoverer: Callable[[], Awaitable[Optional[str]]],
+    ) -> None:
+        try:
+            new_subscription_id = await recoverer()
+            if subscription_id not in self._subscription_recoverers:
+                # unsubscribed while recovery was running
+                return
+            if new_subscription_id is not None:
+                async with self._lock:
+                    stale_alias = self._sub_original_to_alias.pop(subscription_id, None)
+                    if stale_alias is not None:
+                        self._sub_alias_to_original.pop(stale_alias, None)
+                    self._sub_original_to_alias[subscription_id] = new_subscription_id
+                    self._sub_alias_to_original[new_subscription_id] = subscription_id
+                    # grab any messages that arrived under the new id before the alias was in place
+                    early_messages = self._received_subscriptions.pop(
+                        new_subscription_id, None
+                    )
+                while early_messages is not None and not early_messages.empty():
+                    await self.inject_subscription_message(
+                        subscription_id, early_messages.get_nowait()
+                    )
+        except Exception as e:
+            logger.error(
+                f"Failed to recover subscription {subscription_id} after reconnection: {e}"
+            )
+            await self.inject_subscription_message(
+                subscription_id,
+                {
+                    "jsonrpc": "2.0",
+                    "params": {
+                        "subscription": subscription_id,
+                        "result": {"recoveryFailed": str(e)},
+                    },
+                },
+            )
+        finally:
+            self._recovering_subscriptions.discard(subscription_id)
+
+    def arm_response_event(self) -> None:
+        """
+        Clear the response-delivered event, arming it for `wait_response_event`.
+
+        Call this *before* scanning for responses with `retrieve`: anything delivered
+        after arming re-sets the event, so a subsequent `wait_response_event` returns
+        immediately instead of missing the wakeup.
+        """
+        self._response_delivered.clear()
+
+    async def wait_response_event(self, timeout: float = 0.1) -> None:
+        """
+        Wait until a response, subscription message, or error has (possibly) been
+        delivered since the last `arm_response_event`, or until `timeout` elapses.
+
+        This is purely a wakeup optimization over sleep-polling: spurious wakeups are
+        fine (callers re-scan and re-arm), and the fallback timeout means a missed
+        `set()` on an exotic delivery path degrades to a slow poll rather than a hang.
+        """
+        try:
+            # asyncio.timeout schedules a timer handle in place, unlike
+            # wait_for which wraps the wait in a new Task per call — this
+            # runs once per delivered response, so that task shows up.
+            async with asyncio.timeout(timeout):
+                await self._response_delivered.wait()
+        except TimeoutError:
+            pass
 
     async def retrieve(self, item_id: str) -> Optional[dict]:
         """
@@ -1256,6 +1520,13 @@ class Websocket:
                 del self._received[item_id]
                 return res
         else:
+            if item_id in self._orphaned_subscriptions:
+                # delivered once; the consumer is expected to stop polling after this
+                self._orphaned_subscriptions.discard(item_id)
+                raise SubstrateRequestException(
+                    f"Subscription {item_id} was severed by a reconnection and cannot be "
+                    f"resumed because it has no recovery handler."
+                )
             try:
                 subscription = self._received_subscriptions[item_id].get_nowait()
                 self._received_subscriptions[item_id].task_done()
@@ -1277,6 +1548,41 @@ class Websocket:
                     logger.exception(f"Websocket sending exception: {e}")
                     raise e
         return None
+
+    async def wait_for_response(self, item_id: str) -> Optional[dict]:
+        """
+        Await and consume the response for a single in-flight request id.
+
+        Unlike the `arm_response_event`/`retrieve`/`wait_response_event`
+        polling cycle, this awaits the request's own future, so each caller
+        wakes exactly when its own response arrives: concurrent callers
+        cannot consume or delay each other's wakeups through the shared
+        response event. The handler task is watched alongside the future, so
+        a handler that dies before the response arrives surfaces its stored
+        error (via the same triage as `retrieve`) instead of hanging.
+
+        Only valid for plain request ids (not subscription ids). Returns the
+        response dict, or None if the id is unknown.
+        """
+        fut = self._received.get(item_id)
+        while fut is not None and not fut.done():
+            handler = self._send_recv_task
+            if handler is not None and not handler.done():
+                # Neither is cancelled by asyncio.wait on exit.
+                await asyncio.wait({fut, handler}, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Handler dead or absent: `retrieve` raises its stored error.
+                # If it stored none (graceful close with our request still
+                # pending), fall back to a slow poll — a subsequent request
+                # revives the handler, which resends in-flight payloads, and
+                # this then completes normally (mirrors the polling loop).
+                maybe = await self.retrieve(item_id)
+                if maybe is not None:
+                    return maybe
+                await asyncio.wait({fut}, timeout=0.1)
+        # Consume through retrieve for the usual bookkeeping (semaphore
+        # release, cleanup) and error propagation.
+        return await self.retrieve(item_id)
 
     async def discard_request(self, item_id: str) -> None:
         """
@@ -1420,10 +1726,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 )
 
                 if ss58_prefix_constant is not None:
-                    assert isinstance(ss58_prefix_constant.value, int)
-                    self.ss58_format = ss58_prefix_constant.value
-                    runtime.ss58_format = ss58_prefix_constant.value
-                    runtime.runtime_config.ss58_format = ss58_prefix_constant.value
+                    assert isinstance(ss58_prefix_constant, int)
+                    self.ss58_format = ss58_prefix_constant
+                    runtime.ss58_format = ss58_prefix_constant
+                    runtime.runtime_config.ss58_format = ss58_prefix_constant
         self.initialized = True
         self._initializing = False
 
@@ -1565,7 +1871,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         scale_bytes: bytes,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[Any]:
+    ) -> ScaleValue:
         """
         Helper function to decode arbitrary SCALE-bytes (e.g. 0x02000000) according to given type_string
         (e.g. BlockNumber). The relevant versioning information of the type (if defined) will be applied if block_hash
@@ -1579,12 +1885,24 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 loaded based on the block hash specified (or latest block if no block_hash is specified)
 
         Returns:
-            ScaleType object
+            the decoded value as a plain Python value (int/str/bool/dict/list/tuple/None)
         """
         if runtime is None:
             runtime = await self.init_runtime(block_hash=block_hash)
-        obj = scale_decode(type_string, scale_bytes, runtime=runtime)
-        return obj
+        if (
+            isinstance(type_string, str)
+            and isinstance(scale_bytes, (bytes, bytearray))
+            # the strict flag lives on the interface config; Runtime.config
+            # only carries runtime-derived facts like is_weight_v2
+            and self.config.get("strict_scale_decode")
+        ):
+            # Value-decode fast path: plain values with no ScaleType objects.
+            # It always enforces full-buffer consumption, so it is only used
+            # when strict decoding is on (the default).
+            value_fn = runtime.runtime_config.get_value_decoder(type_string)
+            if value_fn is not None:
+                return value_fn(scale_bytes)
+        return scale_decode(type_string, scale_bytes, runtime=runtime).value
 
     async def init_runtime(
         self,
@@ -1848,14 +2166,14 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                     # Decode SCALE result data
                     assert change_scale_type is not None
-                    updated_obj = await self.decode_scale(
+                    updated_value = await self.decode_scale(
                         type_string=change_scale_type,
                         scale_bytes=hex_to_bytes(change_data),
                         runtime=runtime,
                     )
 
                     subscription_result = await subscription_handler(
-                        storage_key, updated_obj.value, subscription_id
+                        storage_key, updated_value, subscription_id
                     )
 
                     if subscription_result is not None:
@@ -2134,7 +2452,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "authority_index"
                                         ]
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
 
@@ -2150,7 +2468,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                                         aura_predigest.decode(check_remaining=True)
 
-                                        assert validator_set is not None
+                                        assert isinstance(validator_set, list)
                                         rank_validator = aura_predigest.value[
                                             "slot_number"
                                         ] % len(validator_set)
@@ -2176,10 +2494,8 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             "data"
                                         ]["authority_index"]
 
-                                        assert validator_set is not None
-                                        block_author = validator_set.elements[
-                                            rank_validator
-                                        ]
+                                        assert isinstance(validator_set, list)
+                                        block_author = validator_set[rank_validator]
                                         block_data["author"] = block_author
                                     else:
                                         raise NotImplementedError(
@@ -2489,7 +2805,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             block_hash=block_hash,
         )
         assert events is not None
-        return cast(list[dict], events.value)
+        return cast(list[dict], events)
 
     async def get_metadata(self, block_hash=None):
         """
@@ -2629,25 +2945,22 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Creates a Preprocessed data object for passing to `_make_rpc_request`
         """
         params = query_for if query_for else []
-        # Search storage call in metadata
+        # Search storage call in metadata (resolved once per storage function
+        # and cached on the metadata object; see StorageKey.prepared)
         if runtime is None:
             runtime = self.runtime
         assert runtime is not None
-        metadata_pallet = runtime.metadata.get_metadata_pallet(module)
-
-        if not metadata_pallet:
-            raise SubstrateRequestException(f'Pallet "{module}" not found')
-
-        storage_item = metadata_pallet.get_storage_function(storage_function)
-
-        if not metadata_pallet or not storage_item:
-            raise StorageFunctionNotFound(
-                f'Storage function "{module}.{storage_function}" not found'
+        try:
+            storage_item, value_scale_type, param_types, *_ = StorageKey.prepared(
+                module,
+                storage_function,
+                runtime_config=runtime.runtime_config,
+                metadata=runtime.metadata,
             )
-
-        # SCALE type string of value
-        param_types = storage_item.get_params_type_string()
-        value_scale_type = storage_item.get_value_type_string()
+        except StorageFunctionNotFound as e:
+            if "Pallet" in str(e):
+                raise SubstrateRequestException(str(e))
+            raise
 
         if len(params) != len(param_types):
             raise ValueError(
@@ -2709,7 +3022,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
         Returns:
              (decoded response, completion)
         """
-        result: dict | ScaleType = response
+        result: dict | ScaleValue = response
         if value_scale_type and isinstance(storage_item, ScaleType):
             if (response_result := response.get("result")) is not None:
                 query_value = response_result
@@ -2742,6 +3055,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         result_handler: Optional[ResultHandler] = None,
         runtime: Optional[Runtime] = None,
         result_processor: Optional[Callable[[dict, str | int], Any]] = None,
+        subscription_recoverer: Optional[
+            Callable[[str], Awaitable[Optional[str]]]
+        ] = None,
     ) -> RequestResults:
         """
         Sends a batch of RPC payloads over the websocket and gathers their responses, optionally decoding
@@ -2757,6 +3073,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 arrives, receiving `(response, item_id)`; its return value replaces the raw response stored in
                 the result map. Lets callers overlap CPU-bound post-processing (e.g. SCALE decoding) with the
                 network wait for the remaining payloads. Mutually exclusive with `result_handler`.
+            subscription_recoverer: optional coroutine function called with the subscription id if the
+                websocket reconnects while the subscription created by these payloads is open; see
+                `Websocket.register_subscription_recoverer` for the contract. Only meaningful together
+                with `result_handler` on subscription-creating payloads.
 
         Returns:
             mapping of payload id to the list of (possibly processed) responses received for that request
@@ -2768,22 +3088,52 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         subscription_added = False
 
+        debug_logging = logger.isEnabledFor(logging.DEBUG)
+
         async with self.ws as ws:
             await ws.mark_waiting_for_response()
             try:
                 for payload in payloads:
                     item_id = await ws.send(payload["payload"])
                     request_manager.add_request(item_id, payload["id"])
-                    # truncate to 2000 chars for debug logging
-                    if len(stringified_payload := str(payload)) < 2_000:
-                        output_payload = stringified_payload
-                    else:
-                        output_payload = f"{stringified_payload[:2_000]} (truncated)"
-                    logger.debug(
-                        f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
+                    if debug_logging:
+                        # truncate to 2000 chars for debug logging
+                        if len(stringified_payload := str(payload)) < 2_000:
+                            output_payload = stringified_payload
+                        else:
+                            output_payload = (
+                                f"{stringified_payload[:2_000]} (truncated)"
+                            )
+                        logger.debug(
+                            f"Submitted payload ID {payload['id']} with websocket ID {item_id}: {output_payload}"
+                        )
+
+                if len(payloads) == 1 and result_handler is None:
+                    # Single plain request (the shape of query/rpc_request/
+                    # runtime_call): await this request's own future instead
+                    # of the shared-event scan loop below. With N concurrent
+                    # callers the shared event degrades badly — every arm()
+                    # clears a wakeup some other caller may still need.
+                    response = await ws.wait_for_response(item_id)
+                    if response is None:
+                        raise SubstrateRequestException(
+                            f"No response for request {item_id}"
+                        )
+                    decoded_response, complete = await self._process_response(
+                        response,
+                        item_id,
+                        value_scale_type,
+                        storage_item,
+                        result_handler,
+                        runtime=runtime,
                     )
+                    if result_processor is not None:
+                        decoded_response = result_processor(decoded_response, item_id)
+                    request_manager.add_response(item_id, decoded_response, complete)
+                    return request_manager.get_results()
 
                 while True:
+                    ws.arm_response_event()
                     for item_id in request_manager.unresponded():
                         if (
                             item_id not in request_manager.responses
@@ -2801,6 +3151,13 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                             item_id, response["result"]
                                         )
                                         subscription_added = True
+                                        if subscription_recoverer is not None:
+                                            ws.register_subscription_recoverer(
+                                                item_id,
+                                                partial(
+                                                    subscription_recoverer, item_id
+                                                ),
+                                            )
                                     except KeyError:
                                         logger.error(
                                             f"Error received from subtensor for {item_id}: {response}\n"
@@ -2828,26 +3185,29 @@ class AsyncSubstrateInterface(SubstrateMixin):
                                 request_manager.add_response(
                                     item_id, decoded_response, complete
                                 )
-                                # truncate to 2000 chars for debug logging
-                                if (
-                                    len(stringified_response := str(decoded_response))
-                                    < 2_000
-                                ):
-                                    output_response = stringified_response
-                                    # avoids clogging logs up needlessly (esp for Metadata stuff)
-                                else:
-                                    output_response = (
-                                        f"{stringified_response[:2_000]} (truncated)"
+                                if debug_logging:
+                                    # truncate to 2000 chars for debug logging
+                                    if (
+                                        len(
+                                            stringified_response := str(
+                                                decoded_response
+                                            )
+                                        )
+                                        < 2_000
+                                    ):
+                                        output_response = stringified_response
+                                        # avoids clogging logs up needlessly (esp for Metadata stuff)
+                                    else:
+                                        output_response = f"{stringified_response[:2_000]} (truncated)"
+                                    logger.debug(
+                                        f"Received response for item ID {item_id}:\n{output_response}\n"
+                                        f"Complete: {complete}"
                                     )
-                                logger.debug(
-                                    f"Received response for item ID {item_id}:\n{output_response}\n"
-                                    f"Complete: {complete}"
-                                )
 
                     if request_manager.is_complete:
                         break
                     else:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in request_manager.unresponded():
@@ -3493,19 +3853,16 @@ class AsyncSubstrateInterface(SubstrateMixin):
         if "error" in result_data:
             raise SubstrateRequestException(result_data["error"]["message"])
         result_vec_u8_bytes = hex_to_bytes(result_data["result"])
-        _decoded = await self.decode_scale(
+        result_bytes = await self.decode_scale(
             "Vec<u8>", result_vec_u8_bytes, runtime=runtime
         )
-        result_bytes = _decoded.value
-
-        # TODO check to see if we can use the bytes from the ScaleType rather than using the value
-        # TODO and then re-encoding as bytes
 
         # Decode result
         # Get correct type
         if isinstance(result_bytes, str):
             raw_bytes = hex_to_bytes(result_bytes)
         else:
+            assert isinstance(result_bytes, (bytes, bytearray, list))
             raw_bytes = bytes(result_bytes)
         result = runtime_call_def["decoder"](raw_bytes, runtime)
         return result
@@ -3590,8 +3947,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         # Decode result
         result_bytes = hex_to_bytes(result_data["result"])
-        obj = await self.decode_scale(output_type_string, result_bytes, runtime=runtime)
-        return obj.value
+        return await self.decode_scale(
+            output_type_string, result_bytes, runtime=runtime
+        )
 
     async def runtime_calls(
         self,
@@ -3723,12 +4081,13 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 item_ids = await ws.send_batch(payloads)
                 pending = set(item_ids)
                 while pending:
+                    ws.arm_response_event()
                     for item_id in list(pending):
                         if (response := await ws.retrieve(item_id)) is not None:
                             responses[item_id] = response
                             pending.discard(item_id)
                     if pending:
-                        await asyncio.sleep(0.01)
+                        await ws.wait_response_event()
             finally:
                 await ws.mark_response_received()
                 for item_id in pending:
@@ -3742,10 +4101,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                 raise SubstrateRequestException(result_data["error"]["message"])
             output_type_string = f"scale_info::{runtime_call_def['output']}"
             result_bytes = hex_to_bytes(result_data["result"])
-            obj = await self.decode_scale(
-                output_type_string, result_bytes, runtime=runtime
+            results.append(
+                await self.decode_scale(
+                    output_type_string, result_bytes, runtime=runtime
+                )
             )
-            results.append(obj.value)
         return results
 
     async def get_account_nonce(self, account_address: str) -> int:
@@ -3768,7 +4128,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
             response = await self.query(
                 module="System", storage_function="Account", params=[account_address]
             )
-            assert response is not None
+            assert isinstance(response, dict)
             return response["nonce"]
 
     def clear_nonce_cache_for_account(self, account_address: str) -> None:
@@ -3862,9 +4222,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         constant_name: str,
         block_hash: Optional[str] = None,
         runtime: Optional[Runtime] = None,
-    ) -> Optional[ScaleType[ScaleValue]]:
+    ) -> Optional[ScaleValue]:
         """
-        Returns the decoded `ScaleType` object of the constant for given module name, call function name and block_hash
+        Returns the decoded value of the constant for given module name, call function name and block_hash
         (or chaintip if block_hash is omitted)
 
         Args:
@@ -3874,13 +4234,12 @@ class AsyncSubstrateInterface(SubstrateMixin):
             runtime: Runtime to use for querying the constant
 
         Returns:
-             ScaleType from the runtime call
+             the decoded constant as a plain Python value, or None when the constant does not exist
         """
         constant = await self.get_metadata_constant(
             module_name, constant_name, block_hash=block_hash, runtime=runtime
         )
         if constant:
-            # Decode to ScaleType
             return await self.decode_scale(
                 constant.type,
                 bytes(constant.constant_value),
@@ -4047,10 +4406,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
         raw_storage_key: Optional[bytes] = None,
         subscription_handler=None,
         runtime: Optional[Runtime] = None,
-    ) -> ScaleType[ScaleValue]:
+    ) -> ScaleValue:
         """
-        Queries substrate. This should only be used when making a single request. For multiple requests,
-        you should use `self.query_multi`
+        Queries substrate, returning the decoded storage value as a plain Python value
+        (int/str/bool/dict/list/tuple/None). This should only be used when making a single request.
+        For multiple requests, you should use `self.query_multi`
         """
         if block_hash:
             self.last_block_hash = block_hash
@@ -4303,11 +4663,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
             max_weight = payment_info["weight"]
 
         # Check if call has existing approvals
-        multisig_details_ = await self.query(
+        multisig_details = await self.query(
             "Multisig", "Multisigs", [multisig_account.value, call.call_hash]
         )
-        multisig_details = multisig_details_.value
-        assert isinstance(multisig_details, dict)
+        assert multisig_details is None or isinstance(multisig_details, dict)
         if multisig_details:
             maybe_timepoint = multisig_details["when"]
         else:
@@ -4361,6 +4720,111 @@ class AsyncSubstrateInterface(SubstrateMixin):
             signature=signature,
         )
 
+    @staticmethod
+    def _extrinsic_hashes_in_block(block: dict) -> list[str]:
+        """Computes the hash of each raw extrinsic in the block of a `chain_getBlock` response."""
+        return [
+            f"0x{blake2b(hex_to_bytes(extrinsic), digest_size=32).hexdigest()}"
+            for extrinsic in block["extrinsics"]
+        ]
+
+    async def _scan_recent_blocks_for_extrinsic(
+        self,
+        extrinsic_hash: str,
+        start_block_hash: str,
+        max_depth: int,
+        known_block_hashes: set[str],
+    ) -> Optional[str]:
+        """
+        Walks backwards from `start_block_hash` through at most `max_depth` blocks, looking for an
+        extrinsic with hash `extrinsic_hash` in the block bodies.
+
+        Args:
+            extrinsic_hash: "0x"-prefixed hash of the extrinsic to look for
+            start_block_hash: hash of the block to start scanning from (inclusive)
+            max_depth: maximum number of blocks to walk back through
+            known_block_hashes: hashes of blocks already scanned; scanning stops upon reaching one of
+                these, and every newly-scanned block hash is added to the set
+
+        Returns:
+            The hash of the block containing the extrinsic, or None if it was not found.
+        """
+        current_hash = start_block_hash
+        for _ in range(max_depth):
+            if current_hash in known_block_hashes:
+                return None
+            response = await self.rpc_request("chain_getBlock", [current_hash])
+            block = response["result"]["block"]
+            known_block_hashes.add(current_hash)
+            if extrinsic_hash in self._extrinsic_hashes_in_block(block):
+                return current_hash
+            if int(block["header"]["number"], 16) == 0:
+                return None
+            current_hash = block["header"]["parentHash"]
+        return None
+
+    async def _is_extrinsic_in_pool(self, extrinsic_hash: str) -> bool:
+        """Checks whether an extrinsic with the given hash is currently in the node's transaction pool."""
+        response = await self.rpc_request("author_pendingExtrinsics", [])
+        return extrinsic_hash in (
+            f"0x{blake2b(hex_to_bytes(pending), digest_size=32).hexdigest()}"
+            for pending in response["result"]
+        )
+
+    async def _wait_for_extrinsic_inclusion_via_polling(
+        self,
+        extrinsic_hash: str,
+        wait_for_finalization: bool,
+        timeout: float = EXTRINSIC_RECOVERY_TIMEOUT,
+        scan_depth: int = EXTRINSIC_RECOVERY_SCAN_DEPTH,
+    ) -> dict:
+        """
+        Waits for an already-submitted extrinsic to be included in a block (or finalized) by polling block
+        bodies rather than via an author_submitAndWatchExtrinsic subscription. Used to resume watching an
+        extrinsic whose watch subscription was severed by a reconnection, since the author API offers no
+        way to attach a watch to an extrinsic already in the pool.
+
+        Args:
+            extrinsic_hash: "0x"-prefixed hash of the extrinsic being watched
+            wait_for_finalization: if True, polls the finalized chain; otherwise the best chain
+            timeout: seconds to wait for inclusion/finalization before giving up
+            scan_depth: maximum number of blocks walked back per poll
+
+        Returns:
+            dict with "block_hash", "extrinsic_hash", and "finalized" keys (the same shape produced by
+            `submit_extrinsic`'s subscription result handler)
+
+        Raises:
+            SubstrateRequestException: if the extrinsic was not observed before `timeout` elapsed
+        """
+        head_method = (
+            "chain_getFinalizedHead" if wait_for_finalization else "chain_getBlockHash"
+        )
+        scanned: set[str] = set()
+
+        async def _poll() -> dict:
+            while True:
+                head_hash = (await self.rpc_request(head_method, []))["result"]
+                found_hash = await self._scan_recent_blocks_for_extrinsic(
+                    extrinsic_hash, head_hash, scan_depth, scanned
+                )
+                if found_hash is not None:
+                    return {
+                        "block_hash": found_hash,
+                        "extrinsic_hash": extrinsic_hash,
+                        "finalized": wait_for_finalization,
+                    }
+                await asyncio.sleep(EXTRINSIC_RECOVERY_POLL_INTERVAL)
+
+        try:
+            return await asyncio.wait_for(_poll(), timeout)
+        except asyncio.TimeoutError:
+            raise SubstrateRequestException(
+                f"Extrinsic {extrinsic_hash} was submitted, but its "
+                f"{'finalization' if wait_for_finalization else 'inclusion'} was not observed within "
+                f"{timeout}s of the watch subscription being severed."
+            )
+
     async def submit_extrinsic(
         self,
         extrinsic: GenericExtrinsic,
@@ -4384,6 +4848,9 @@ class AsyncSubstrateInterface(SubstrateMixin):
         # Check requirements
         if not isinstance(extrinsic, GenericExtrinsic):
             raise TypeError("'extrinsic' must be of type Extrinsic")
+
+        extrinsic_hex = str(extrinsic.data)
+        extrinsic_hash = f"0x{extrinsic.extrinsic_hash.hex()}"
 
         async def result_handler(message: dict, subscription_id) -> tuple[dict, bool]:
             """
@@ -4429,6 +4896,11 @@ class AsyncSubstrateInterface(SubstrateMixin):
                     failure_message = (
                         f"Subscription {subscription_id} invalid: {message_result}"
                     )
+                if "recoveryfailed" in message_result:
+                    failure_message = (
+                        f"Subscription {subscription_id} was severed by a websocket reconnection, "
+                        f"and could not be recovered: {message_result}"
+                    )
                 if "future" in message_result:
                     logger.warning(
                         f"Subscription {subscription_id} is temporarily in the local buffer pool,"
@@ -4447,7 +4919,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                         await ws.unsubscribe(subscription_id)
                     return {
                         "block_hash": message_result["finalized"],
-                        "extrinsic_hash": "0x{}".format(extrinsic.extrinsic_hash.hex()),
+                        "extrinsic_hash": extrinsic_hash,
                         "finalized": True,
                     }, True
                 elif (
@@ -4462,7 +4934,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
                         "block_hash": message_result.get(
                             "inblock", message_result.get("inBlock")
                         ),
-                        "extrinsic_hash": "0x{}".format(extrinsic.extrinsic_hash.hex()),
+                        "extrinsic_hash": extrinsic_hash,
                         "finalized": False,
                     }, True
 
@@ -4475,19 +4947,91 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
             return message, False
 
-        if wait_for_inclusion or wait_for_finalization:
-            responses = (
-                await self._make_rpc_request(
-                    [
-                        self.make_payload(
-                            "rpc_request",
-                            "author_submitAndWatchExtrinsic",
-                            [str(extrinsic.data)],
-                        )
-                    ],
-                    result_handler=result_handler,
+        async def subscription_recoverer(old_subscription_id: str) -> Optional[str]:
+            """
+            Recovers a severed extrinsic-watch subscription after a websocket reconnection.
+
+            First checks whether the extrinsic already reached the chain (recent blocks, then the
+            transaction pool). If it never arrived, it is resubmitted (the same signed bytes, so the same
+            hash — never a duplicate execution) and the fresh subscription id is returned for aliasing.
+            If it did arrive, inclusion or finalization is instead watched by polling block bodies, and
+            the terminal subscription message is injected so the original watcher completes normally.
+            """
+            logger.warning(
+                f"Extrinsic watch subscription {old_subscription_id} for {extrinsic_hash} was severed "
+                f"by a reconnection. Attempting recovery."
+            )
+            scanned: set[str] = set()
+            best_head = (await self.rpc_request("chain_getBlockHash", []))["result"]
+            included_in = await self._scan_recent_blocks_for_extrinsic(
+                extrinsic_hash, best_head, EXTRINSIC_RECOVERY_SCAN_DEPTH, scanned
+            )
+            if included_in is None and not await self._is_extrinsic_in_pool(
+                extrinsic_hash
+            ):
+                # it never reached the node: resubmit, and resume watching under the new subscription id
+                try:
+                    response_ = await self.rpc_request(
+                        "author_submitAndWatchExtrinsic", [extrinsic_hex]
+                    )
+                    logger.info(
+                        f"Extrinsic {extrinsic_hash} had not been received by the chain. Resubmitted."
+                    )
+                    return response_["result"]
+                except SubstrateRequestException as e:
+                    if "already imported" not in str(e).lower():
+                        raise
+                    # it raced in after all; fall through to polling
+
+            if included_in is not None and not wait_for_finalization:
+                message_result = {"inBlock": included_in}
+            else:
+                block_info = await self._wait_for_extrinsic_inclusion_via_polling(
+                    extrinsic_hash, wait_for_finalization
                 )
-            )["rpc_request"]
+                key = "finalized" if wait_for_finalization else "inBlock"
+                message_result = {key: block_info["block_hash"]}
+            logger.info(
+                f"Recovered watched extrinsic {extrinsic_hash}: {message_result}"
+            )
+            await self.ws.inject_subscription_message(
+                old_subscription_id,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "author_extrinsicUpdate",
+                    "params": {
+                        "subscription": old_subscription_id,
+                        "result": message_result,
+                    },
+                },
+            )
+            return None
+
+        if wait_for_inclusion or wait_for_finalization:
+            try:
+                responses = (
+                    await self._make_rpc_request(
+                        [
+                            self.make_payload(
+                                "rpc_request",
+                                "author_submitAndWatchExtrinsic",
+                                [extrinsic_hex],
+                            )
+                        ],
+                        result_handler=result_handler,
+                        subscription_recoverer=subscription_recoverer,
+                    )
+                )["rpc_request"]
+            except SubstrateRequestException as e:
+                if "already imported" not in str(e).lower():
+                    raise
+                # The node already has this extrinsic even though the watch request errored — most
+                # likely a reconnection re-sent an in-flight submission. Watch it by polling instead.
+                responses = [
+                    await self._wait_for_extrinsic_inclusion_via_polling(
+                        extrinsic_hash, wait_for_finalization
+                    )
+                ]
             response = next(
                 (r for r in responses if "block_hash" in r and "extrinsic_hash" in r),
                 None,
@@ -4506,12 +5050,25 @@ class AsyncSubstrateInterface(SubstrateMixin):
             )
 
         else:
-            response = await self.rpc_request(
-                "author_submitExtrinsic", [str(extrinsic.data)]
-            )
+            try:
+                response = await self.rpc_request(
+                    "author_submitExtrinsic", [extrinsic_hex]
+                )
+                submitted_hash = response["result"]
+            except SubstrateRequestException as e:
+                if "already imported" not in str(e).lower():
+                    raise
+                # The node already has this extrinsic even though this call errored — most
+                # likely a reconnection re-sent an in-flight submission. The submission itself
+                # succeeded, and the hash is deterministic from the signed bytes.
+                logger.info(
+                    f"Extrinsic {extrinsic_hash} was already imported by the node "
+                    f"(likely resubmitted by a reconnection); treating as submitted."
+                )
+                submitted_hash = extrinsic_hash
 
             result = AsyncExtrinsicReceipt(
-                substrate=self, extrinsic_hash=response["result"]
+                substrate=self, extrinsic_hash=submitted_hash
             )
 
         return result
@@ -4694,82 +5251,6 @@ class AsyncSubstrateInterface(SubstrateMixin):
             return asyncio.create_task(co)
         else:
             return await co
-
-
-class DiskCachedAsyncSubstrateInterface(AsyncSubstrateInterface):
-    """
-    Uses disk-caching in addition to memory-caching for the cached methods
-
-    Loads the cache from the disk at startup, where it is kept in-memory, and dumps to the disk
-    when the connection is closed.
-
-    For `wss://` endpoints, a persistent `_SessionResumingSSLContext` is created so
-    that TLS sessions are reused across reconnections.  The effective session TTL is the minimum
-    of `ssl_session_ttl` (default `SSL_SESSION_TTL`) and the server-advertised timeout.
-    """
-
-    def __init__(
-        self,
-        url: str,
-        *args,
-        ssl_session_ttl: int = SSL_SESSION_TTL,
-        **kwargs,
-    ):
-        ssl_context: Optional[_SessionResumingSSLContext] = None
-        if url.startswith("wss://") and not kwargs.get("_mock", False):
-            ssl_context = _SessionResumingSSLContext(session_ttl=ssl_session_ttl)
-            ssl_context.set_default_verify_paths()
-        kwargs.pop("_ssl_context", None)
-        super().__init__(url, *args, _ssl_context=ssl_context, **kwargs)  # type: ignore[misc]
-
-    async def initialize(self) -> None:
-        db = AsyncSqliteDB(self.url)
-        cached = await db.load_dns_cache(self.url)
-        if cached is not None:
-            addrinfos, saved_at_unix = cached
-            age = time.time() - saved_at_unix
-            # Reconstruct a monotonic timestamp so _resolve_host's TTL check works correctly
-            self.ws._dns_cache = (addrinfos, time.monotonic() - age)
-            logger.debug(f"Loaded DNS cache from disk (age={age:.0f}s)")
-        await self.runtime_cache.load_from_disk(self.url)
-        await self._initialize()
-
-    async def close(self):
-        """
-        Closes the substrate connection and the websocket connection, dumps the runtime and DNS
-        caches to disk.
-        """
-        db = AsyncSqliteDB(self.url)
-        dns_cache = getattr(self.ws, "_dns_cache", None)
-        if dns_cache is not None:
-            addrinfos, _ = dns_cache
-            await db.save_dns_cache(self.url, addrinfos)
-        try:
-            await self.runtime_cache.dump_to_disk(self.url)
-            await self.ws.shutdown()
-        except AttributeError:
-            pass
-        await db.close()
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def get_parent_block_hash(self, block_hash):
-        return await self._get_parent_block_hash(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_RUNTIME_CACHE_SIZE)
-    async def get_block_runtime_info(self, block_hash: str) -> dict:
-        return await self._get_block_runtime_info(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def get_block_runtime_version_for(self, block_hash: str):
-        return await self._get_block_runtime_version_for(block_hash)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def _cached_get_block_hash(self, block_id: int) -> str:
-        return await self._get_block_hash(block_id)
-
-    @async_sql_lru_cache(maxsize=SUBSTRATE_CACHE_METHOD_SIZE)
-    async def _cached_get_block_number(self, block_hash: str) -> int:
-        return await self._get_block_number(block_hash=block_hash)
 
 
 async def get_async_substrate_interface(

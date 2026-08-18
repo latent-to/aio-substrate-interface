@@ -163,7 +163,7 @@ async def test_bits():
         storage_function="AlphaSqrtPrice",
         params=[71],
     )
-    assert isinstance(current_sqrt_price.value, dict)
+    assert isinstance(current_sqrt_price, dict)
 
 
 async def test_same_events():

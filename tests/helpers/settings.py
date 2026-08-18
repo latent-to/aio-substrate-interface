@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from os import environ
 
 KUSAMA_NODE_URL = (
@@ -33,6 +34,6 @@ AURA_NODE_URL = (
     environ.get("SUBSTRATE_AURA_NODE_URL") or "wss://acala-rpc-1.aca-api.network"
 )
 
-ARCHIVE_ENTRYPOINT = "wss://archive.sub.latent.to"
+ARCHIVE_ENTRYPOINT = os.getenv("ARCHIVE_ENDPOINT", "wss://archive.sub.latent.to")
 
-LATENT_LITE_ENTRYPOINT = "wss://lite.sub.latent.to:443"
+LATENT_LITE_ENTRYPOINT = os.getenv("RPC_ENDPOINT", "wss://lite.sub.latent.to:443")

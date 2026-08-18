@@ -12,7 +12,7 @@ import unittest
 from scalecodec import ScaleBytes
 
 from async_substrate_interface.errors import StorageFunctionNotFound
-from async_substrate_interface.sync_substrate import SubstrateInterface
+from async_substrate_interface.async_substrate import AsyncSubstrateInterface
 from async_substrate_interface.utils.storage import StorageKey
 from tests.helpers.fixtures import metadata_node_template_hex
 
@@ -20,7 +20,7 @@ from tests.helpers.fixtures import metadata_node_template_hex
 class StorageKeyBatchTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.substrate = SubstrateInterface(
+        cls.substrate = AsyncSubstrateInterface(
             url="dummy",
             ss58_format=42,
             type_registry_preset="substrate-node-template",
