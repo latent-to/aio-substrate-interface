@@ -1695,6 +1695,10 @@ class AsyncSubstrateInterface(SubstrateMixin):
         self._mock = _mock
         self.startup_runtime_task: Optional[asyncio.Task] = None
         self.startup_block_hash: Optional[str] = None
+        # None = untested, then True/False after the first attempt. Nodes keep
+        # state_getPairs behind --rpc-methods unsafe; wortel-facade endpoints
+        # serve it (the whole map in one round trip).
+        self._supports_state_get_pairs: Optional[bool] = None
 
     async def __aenter__(self):
         if not self._mock:
@@ -4531,6 +4535,34 @@ class AsyncSubstrateInterface(SubstrateMixin):
         if max_results is not None and max_results < page_size:
             page_size = max_results
 
+        # Whole-map fast path: one state_getPairs round trip and one server-side
+        # traversal, where the endpoint serves it (wortel facade; nodes keep it
+        # behind unsafe RPC). Falls through to the paged path otherwise.
+        if fully_exhaust and max_results is None and start_key == prefix:
+            pairs = await self._maybe_state_get_pairs(prefix, block_hash, runtime)
+            if pairs is not None:
+                return AsyncQueryMapResult(
+                    records=decode_query_map(
+                        pairs,
+                        prefix,
+                        runtime,
+                        param_types,
+                        params,
+                        value_type,
+                        key_hashers,
+                        ignore_decoding_errors,
+                    ),
+                    page_size=page_size,
+                    module=module,
+                    storage_function=storage_function,
+                    params=params,
+                    block_hash=block_hash,
+                    substrate=self,
+                    last_key=pairs[-1][0] if pairs else None,
+                    max_results=max_results,
+                    ignore_decoding_errors=ignore_decoding_errors,
+                )
+
         # Retrieve storage keys
         if not fully_exhaust:
             response = await self.rpc_request(
@@ -4626,6 +4658,31 @@ class AsyncSubstrateInterface(SubstrateMixin):
             max_results=max_results,
             ignore_decoding_errors=ignore_decoding_errors,
         )
+
+    async def _maybe_state_get_pairs(
+        self, prefix: str, block_hash: Optional[str], runtime: Runtime
+    ) -> Optional[list]:
+        """Try `state_getPairs` — the whole map under `prefix` in one request.
+        Returns the `[key, value]` hex pairs, or None when the endpoint does
+        not serve the method (result cached after the first attempt)."""
+        if self._supports_state_get_pairs is False:
+            return None
+        try:
+            response = await self.rpc_request(
+                method="state_getPairs",
+                params=[prefix, block_hash],
+                runtime=runtime,
+            )
+            result = response.get("result")
+        except SubstrateRequestException:
+            result = None
+        if not isinstance(result, list):
+            if self._supports_state_get_pairs is None:
+                logger.debug("endpoint does not serve state_getPairs")
+            self._supports_state_get_pairs = False
+            return None
+        self._supports_state_get_pairs = True
+        return result
 
     async def create_multisig_extrinsic(
         self,

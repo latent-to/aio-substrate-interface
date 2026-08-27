@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.2.0 /2026-08-27
+
+* Add support for `state_getPairs`
+
+**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v3.1.0...v3.2.0
+
+## 3.1.0 /2026-08-10
+
+* Speed Optimisations by @thewhaleking in #8
+* drops support for Python 3.10
+
+**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v3.0.0...v3.1.0
+
 ## 3.0.0 /2026-08-03
 
 ### Breaking Changes
