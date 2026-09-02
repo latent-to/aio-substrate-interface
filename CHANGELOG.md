@@ -4,14 +4,14 @@
 
 * Add support for `state_getPairs`
 
-**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v3.1.0...v3.2.0
+**Full Changelog**: https://github.com/latent-to/aio-substrate-interface/compare/v3.1.0...v3.2.0
 
 ## 3.1.0 /2026-08-10
 
 * Speed Optimisations by @thewhaleking in #8
 * drops support for Python 3.10
 
-**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v3.0.0...v3.1.0
+**Full Changelog**: https://github.com/latent-to/aio-substrate-interface/compare/v3.0.0...v3.1.0
 
 ## 3.0.0 /2026-08-03
 
@@ -48,8 +48,6 @@
 * General optimisations enabled by cyscale 0.6/0.7's plain-Python decoding.
 * Added a `benchmarks/` suite: local RPC latency, runtime calls, and real-world scenario comparisons against the
   bittensor v11 stack, reproducible against a fixed block number.
-
-**Full Changelog**: https://github.com/latent-to/async-substrate-interface/compare/v2.2.1...v3.0.0
 
 ## 2.2.1 /2026-06-29
 
