@@ -863,3 +863,42 @@ class TestAsyncExtrinsicReceiptProcessEvents:
         assert await receipt.total_fee_amount == 0
         assert await receipt.weight is None
         substrate.init_runtime.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "finalized_only, subscribe_method",
+    [(True, "chain_subscribeFinalizedHeads"), (False, "chain_subscribeNewHeads")],
+)
+@pytest.mark.asyncio
+async def test_block_handler_subscription_is_recoverable(
+    finalized_only, subscribe_method
+):
+    """
+    A heads subscription must register a recoverer, otherwise a websocket reconnection orphans it and
+    the block handler dies. The recoverer resubscribes and returns the new id for aliasing.
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+    substrate.init_runtime = AsyncMock(return_value=MagicMock())
+    captured = {}
+
+    async def fake_make_rpc_request(payloads, *args, **kwargs):
+        captured["payloads"] = payloads
+        captured["subscription_recoverer"] = kwargs.get("subscription_recoverer")
+        return {"_get_block_handler": [None]}
+
+    substrate._make_rpc_request = fake_make_rpc_request
+
+    async def handler(block):
+        return None
+
+    await substrate._get_block_handler(
+        "0xabc", subscription_handler=handler, finalized_only=finalized_only
+    )
+
+    assert captured["payloads"][0]["payload"]["method"] == subscribe_method
+    recoverer = captured["subscription_recoverer"]
+    assert recoverer is not None
+
+    substrate.rpc_request = AsyncMock(return_value={"result": "new-sub"})
+    assert await recoverer("old-sub") == "new-sub"
+    substrate.rpc_request.assert_awaited_once_with(subscribe_method, [])

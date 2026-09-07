@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.2.1 /2026-09-07
+
+* `get_block_handler` / `subscribe_block_headers` head subscriptions (`chain_subscribeNewHeads` /
+  `chain_subscribeFinalizedHeads`) now register a subscription recoverer, so they are re-established after a
+  websocket reconnection instead of being dropped with "Open subscriptions with no recovery handler cannot survive
+  a reconnection". Heads finalized during the outage are not replayed.
+
+**Full Changelog**: https://github.com/latent-to/aio-substrate-interface/compare/v3.2.0...v3.2.1
+
 ## 3.2.0 /2026-08-27
 
 * Add support for `state_getPairs`

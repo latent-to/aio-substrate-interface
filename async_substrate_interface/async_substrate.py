@@ -2540,16 +2540,37 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                 return subscription_result, reached
 
+            subscribe_method = f"chain_subscribe{rpc_method_prefix}Heads"
+
+            async def subscription_recoverer(old_subscription_id: str) -> Optional[str]:
+                """
+                Re-establishes the heads subscription after a websocket reconnection.
+
+                The node keeps no subscription state across connections, so without this the
+                subscription would be orphaned and the consumer's next retrieve would raise. The
+                new server-side id is returned for aliasing, so the handler keeps receiving heads
+                under the original id. Heads finalized while the connection was down are not
+                replayed by the node: a consumer that needs every block must detect the jump in
+                block numbers itself.
+                """
+                logger.warning(
+                    f"{subscribe_method} subscription {old_subscription_id} was severed by a "
+                    f"reconnection. Resubscribing."
+                )
+                response = await self.rpc_request(subscribe_method, [])
+                return response["result"]
+
             result = await self._make_rpc_request(
                 [
                     self.make_payload(
                         "_get_block_handler",
-                        f"chain_subscribe{rpc_method_prefix}Heads",
+                        subscribe_method,
                         [],
                     )
                 ],
                 result_handler=result_handler,
                 runtime=runtime,
+                subscription_recoverer=subscription_recoverer,
             )
 
             return result["_get_block_handler"][-1]
