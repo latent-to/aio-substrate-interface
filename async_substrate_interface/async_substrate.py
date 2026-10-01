@@ -2136,6 +2136,8 @@ class AsyncSubstrateInterface(SubstrateMixin):
             storage_keys: StorageKey list of storage keys to subscribe to
             subscription_handler: coroutine function to handle value changes of subscription
 
+        Returns:
+            Value returned by `subscription_handler`
         """
         runtime = await self.init_runtime()
 
@@ -2143,9 +2145,7 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
         async def result_handler(
             message: dict, subscription_id: str
-        ) -> tuple[bool, Optional[Any]]:
-            result_found = False
-            subscription_result = None
+        ) -> tuple[Any, bool]:
             if "params" in message:
                 # Process changes
                 for change_storage_key, change_data in message["params"]["result"][
@@ -2158,7 +2158,6 @@ class AsyncSubstrateInterface(SubstrateMixin):
                     assert msf is not None
                     if change_data is not None:
                         change_scale_type = storage_key.value_scale_type
-                        result_found = True
                     elif msf.value["modifier"] == "Default":
                         # Fallback to default value of storage function if no result
                         change_scale_type = storage_key.value_scale_type
@@ -2182,24 +2181,30 @@ class AsyncSubstrateInterface(SubstrateMixin):
 
                     if subscription_result is not None:
                         # Handler returned end result: unsubscribe from further updates
-                        unsub_task = asyncio.create_task(
-                            self.rpc_request(
-                                "state_unsubscribeStorage", [subscription_id]
+                        async with self.ws as ws:
+                            await ws.unsubscribe(
+                                subscription_id, method="state_unsubscribeStorage"
                             )
-                        )
-                        self._forgettable_tasks.add(unsub_task)
-                        unsub_task.add_done_callback(self._forgettable_tasks.discard)
+                        return subscription_result, True
 
-            return result_found, subscription_result
+            return None, False
 
         if not callable(subscription_handler):
             raise ValueError("Provided `subscription_handler` is not callable")
 
-        return await self.rpc_request(
-            "state_subscribeStorage",
-            [[s.to_hex() for s in storage_keys]],
-            result_handler=result_handler,  # type: ignore[arg-type]
+        result = await self._make_rpc_request(
+            [
+                self.make_payload(
+                    "subscribe_storage",
+                    "state_subscribeStorage",
+                    [[s.to_hex() for s in storage_keys]],
+                )
+            ],
+            result_handler=result_handler,
+            runtime=runtime,
         )
+
+        return result["subscribe_storage"][-1]
 
     async def retrieve_pending_extrinsics(self) -> list:
         """

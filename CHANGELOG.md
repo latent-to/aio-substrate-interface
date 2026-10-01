@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.2.2 /2026-10-01
+
+* `subsribe_storage` raised a TypeError; its result handler returns `(result_found, subscription_result)`, but
+  `_process_response` expects `(message, complete)`
+
 ## 3.2.1 /2026-09-07
 
 * `get_block_handler` / `subscribe_block_headers` head subscriptions (`chain_subscribeNewHeads` /

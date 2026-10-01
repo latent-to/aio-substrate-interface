@@ -902,3 +902,69 @@ async def test_block_handler_subscription_is_recoverable(
     substrate.rpc_request = AsyncMock(return_value={"result": "new-sub"})
     assert await recoverer("old-sub") == "new-sub"
     substrate.rpc_request.assert_awaited_once_with(subscribe_method, [])
+
+
+@pytest.mark.asyncio
+async def test_subscribe_storage_returns_handler_result_and_unsubscribes():
+    """
+    `subscribe_storage` must run until the handler returns a value, return that value, and unsubscribe.
+    Its result handler has to follow the `(result, complete)` contract of `_process_response`.
+    """
+    substrate = AsyncSubstrateInterface("ws://localhost", _mock=True)
+    substrate.init_runtime = AsyncMock(return_value=MagicMock())
+    substrate.decode_scale = AsyncMock(
+        side_effect=lambda type_string, scale_bytes, runtime: int.from_bytes(
+            scale_bytes, "little"
+        )
+    )
+    substrate.ws.__aenter__.return_value = substrate.ws
+
+    storage_key = MagicMock()
+    storage_key.to_hex.return_value = "0xkey"
+    storage_key.value_scale_type = "u32"
+
+    def notification(*values):
+        changes = [["0xkey", value] for value in values]
+        return {"params": {"subscription": "sub-1", "result": {"changes": changes}}}
+
+    messages = [
+        {"jsonrpc": "2.0", "result": "sub-1", "id": 1},
+        notification("0x01000000"),
+        # the handler finishes on the first change; the second must not be delivered
+        notification("0x02000000", "0x03000000"),
+        notification("0x04000000"),
+    ]
+    captured = {}
+
+    async def fake_make_rpc_request(payloads, *args, result_handler=None, **kwargs):
+        captured["payloads"] = payloads
+        results = []
+        for message in messages:
+            result, complete = await substrate._process_response(
+                message, "sub-1", result_handler=result_handler
+            )
+            results.append(result)
+            if complete:
+                break
+        return {payloads[0]["id"]: results}
+
+    substrate._make_rpc_request = fake_make_rpc_request
+    seen = []
+
+    async def handler(key, value, subscription_id):
+        assert key is storage_key
+        assert subscription_id == "sub-1"
+        seen.append(value)
+        if value >= 2:
+            return {"final": value}
+
+    result = await substrate.subscribe_storage([storage_key], handler)
+
+    assert result == {"final": 2}
+    assert seen == [1, 2]
+    payload = captured["payloads"][0]["payload"]
+    assert payload["method"] == "state_subscribeStorage"
+    assert payload["params"] == [["0xkey"]]
+    substrate.ws.unsubscribe.assert_awaited_once_with(
+        "sub-1", method="state_unsubscribeStorage"
+    )
